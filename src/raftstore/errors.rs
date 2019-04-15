@@ -1,35 +1,36 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::error;
 use std::io;
 use std::net;
 use std::result;
 
+use crossbeam::TrySendError;
 use protobuf::{ProtobufError, RepeatedField};
 
+use crate::pd;
 use kvproto::{errorpb, metapb};
-use pd;
 use raft;
-use util::codec;
+use tikv_util::codec;
 
 use super::coprocessor::Error as CopError;
 use super::store::SnapError;
-use util::{escape, transport};
+use tikv_util::escape;
 
 pub const RAFTSTORE_IS_BUSY: &str = "raftstore is busy";
 
-quick_error!{
+/// Describes why a message is discarded.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum DiscardReason {
+    /// Channel is disconnected, message can't be delivered.
+    Disconnected,
+    /// Message is dropped due to some filter rules, usually in tests.
+    Filtered,
+    /// Channel runs out of capacity, message can't be delivered.
+    Full,
+}
+
+quick_error! {
     #[derive(Debug)]
     pub enum Error {
         RaftEntryTooLarge(region_id: u64, entry_size: u64) {
@@ -60,7 +61,7 @@ quick_error!{
                     escape(region.get_end_key()),
                     region.get_id())
         }
-        Other(err: Box<error::Error + Sync + Send>) {
+        Other(err: Box<dyn error::Error + Sync + Send>) {
             from()
             cause(err.as_ref())
             description(err.description())
@@ -74,12 +75,10 @@ quick_error!{
             description(err.description())
             display("Io {}", err)
         }
-        // RocksDb uses plain string as the error.
-        // Maybe other libs use this too?
-        RocksDb(msg: String) {
+        Engine(err: engine::Error) {
             from()
-            description("RocksDb error")
-            display("RocksDb {}", msg)
+            description("Engine error")
+            display("Engine {:?}", err)
         }
         Protobuf(err: ProtobufError) {
             from()
@@ -115,9 +114,9 @@ quick_error!{
             description("request timeout")
             display("Timeout {}", msg)
         }
-        StaleEpoch(msg: String, new_regions: Vec<metapb::Region>) {
-            description("region is stale")
-            display("StaleEpoch {}", msg)
+        EpochNotMatch(msg: String, new_regions: Vec<metapb::Region>) {
+            description("region epoch is not match")
+            display("EpochNotMatch {}", msg)
         }
         StaleCommand {
             description("stale command")
@@ -128,11 +127,9 @@ quick_error!{
             description(err.description())
             display("Coprocessor {}", err)
         }
-        Transport(err: transport::Error) {
-            from()
-            cause(err)
-            description(err.description())
-            display("Transport {}", err)
+        Transport(reason: DiscardReason) {
+            description("failed to send a message")
+            display("Discard due to {:?}", reason)
         }
         Snapshot(err: SnapError) {
             from()
@@ -166,7 +163,14 @@ impl Into<errorpb::Error> for Error {
                     .mut_raft_entry_too_large()
                     .set_entry_size(entry_size);
             }
-            Error::StoreNotMatch(..) => errorpb.set_store_not_match(errorpb::StoreNotMatch::new()),
+            Error::StoreNotMatch(to_store_id, my_store_id) => {
+                errorpb
+                    .mut_store_not_match()
+                    .set_request_store_id(to_store_id);
+                errorpb
+                    .mut_store_not_match()
+                    .set_actual_store_id(my_store_id);
+            }
             Error::KeyNotInRegion(key, region) => {
                 errorpb.mut_key_not_in_region().set_key(key);
                 errorpb
@@ -179,22 +183,42 @@ impl Into<errorpb::Error> for Error {
                     .mut_key_not_in_region()
                     .set_end_key(region.get_end_key().to_vec());
             }
-            Error::StaleEpoch(_, new_regions) => {
-                let mut e = errorpb::StaleEpoch::new();
-                e.set_new_regions(RepeatedField::from_vec(new_regions));
-                errorpb.set_stale_epoch(e);
+            Error::EpochNotMatch(_, new_regions) => {
+                let mut e = errorpb::EpochNotMatch::new();
+                e.set_current_regions(RepeatedField::from_vec(new_regions));
+                errorpb.set_epoch_not_match(e);
             }
             Error::StaleCommand => {
                 errorpb.set_stale_command(errorpb::StaleCommand::new());
             }
-            Error::Transport(transport::Error::Discard(_)) => {
+            Error::Transport(reason) if reason == DiscardReason::Full => {
                 let mut server_is_busy_err = errorpb::ServerIsBusy::new();
                 server_is_busy_err.set_reason(RAFTSTORE_IS_BUSY.to_owned());
                 errorpb.set_server_is_busy(server_is_busy_err);
+            }
+            Error::Engine(engine::Error::NotInRange(key, region_id, start_key, end_key)) => {
+                errorpb.mut_key_not_in_region().set_key(key);
+                errorpb.mut_key_not_in_region().set_region_id(region_id);
+                errorpb
+                    .mut_key_not_in_region()
+                    .set_start_key(start_key.to_vec());
+                errorpb
+                    .mut_key_not_in_region()
+                    .set_end_key(end_key.to_vec());
             }
             _ => {}
         };
 
         errorpb
+    }
+}
+
+impl<T> From<TrySendError<T>> for Error {
+    #[inline]
+    fn from(e: TrySendError<T>) -> Error {
+        match e {
+            TrySendError::Full(_) => Error::Transport(DiscardReason::Full),
+            TrySendError::Disconnected(_) => Error::Transport(DiscardReason::Disconnected),
+        }
     }
 }

@@ -1,20 +1,9 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::{EvalContext, Result, ScalarFunc};
-use coprocessor::codec::mysql::{Decimal, Duration, Json, Time};
-use coprocessor::codec::Datum;
-use coprocessor::dag::expr::Expression;
+use crate::coprocessor::codec::mysql::{Decimal, Duration, Json, Time};
+use crate::coprocessor::codec::Datum;
+use crate::coprocessor::dag::expr::Expression;
 use std::borrow::Cow;
 
 fn if_null<F, T>(mut f: F) -> Result<Option<T>>
@@ -228,14 +217,14 @@ impl ScalarFunc {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use protobuf::RepeatedField;
     use tipb::expression::{Expr, ExprType, ScalarFuncSig};
 
-    use coprocessor::codec::mysql::{Duration, Json, Time};
-    use coprocessor::codec::Datum;
-    use coprocessor::dag::expr::test::{col_expr, datum_expr, scalar_func_expr, str2dec};
-    use coprocessor::dag::expr::{EvalContext, Expression};
+    use crate::coprocessor::codec::mysql::{Duration, Json, Time};
+    use crate::coprocessor::codec::Datum;
+    use crate::coprocessor::dag::expr::tests::{col_expr, datum_expr, scalar_func_expr, str2dec};
+    use crate::coprocessor::dag::expr::{EvalContext, Expression};
 
     #[test]
     fn test_if_null() {
@@ -329,8 +318,7 @@ mod test {
         for (operator, branch1, branch2, exp) in tests {
             let arg1 = datum_expr(branch1);
             let arg2 = datum_expr(branch2);
-            let op =
-                Expression::build(&mut ctx, scalar_func_expr(operator, &[arg1, arg2])).unwrap();
+            let op = Expression::build(&ctx, scalar_func_expr(operator, &[arg1, arg2])).unwrap();
             let res = op.eval(&mut ctx, &[]).unwrap();
             assert_eq!(res, exp);
         }
@@ -464,9 +452,9 @@ mod test {
             let arg1 = datum_expr(cond);
             let arg2 = datum_expr(branch1);
             let arg3 = datum_expr(branch2);
-            let expected = Expression::build(&mut ctx, datum_expr(exp)).unwrap();
-            let op = Expression::build(&mut ctx, scalar_func_expr(operator, &[arg1, arg2, arg3]))
-                .unwrap();
+            let expected = Expression::build(&ctx, datum_expr(exp)).unwrap();
+            let op =
+                Expression::build(&ctx, scalar_func_expr(operator, &[arg1, arg2, arg3])).unwrap();
             let lhs = op.eval(&mut ctx, &[]).unwrap();
             let rhs = expected.eval(&mut ctx, &[]).unwrap();
             assert_eq!(lhs, rhs);
@@ -539,7 +527,7 @@ mod test {
             expr.set_sig(sig);
 
             expr.set_children(RepeatedField::from_vec(children));
-            let e = Expression::build(&mut ctx, expr).unwrap();
+            let e = Expression::build(&ctx, expr).unwrap();
             let res = e.eval(&mut ctx, &row).unwrap();
             assert_eq!(res, exp);
         }

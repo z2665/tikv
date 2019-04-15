@@ -1,15 +1,4 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::ops::Deref;
 use std::sync::Arc;
@@ -18,7 +7,7 @@ use kvproto::import_sstpb::*;
 use kvproto::kvrpcpb::*;
 use kvproto::metapb::*;
 
-use pd::RegionInfo;
+use crate::pd::RegionInfo;
 
 use super::client::*;
 
@@ -64,6 +53,7 @@ impl Deref for RangeInfo {
     }
 }
 
+/// RangeContext helps to decide a range end key.
 pub struct RangeContext<Client> {
     client: Arc<Client>,
     region: Option<RegionInfo>,
@@ -97,7 +87,7 @@ impl<Client: ImportClient> RangeContext<Client> {
         self.region = match self.client.get_region(key) {
             Ok(region) => Some(region),
             Err(e) => {
-                error!("get region: {:?}", e);
+                error!("get region failed"; "err" => %e);
                 None
             }
         }
@@ -145,7 +135,7 @@ pub fn find_region_peer(region: &Region, store_id: u64) -> Option<Peer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use import::test_helpers::*;
+    use crate::import::test_helpers::*;
 
     #[test]
     fn test_before_end() {

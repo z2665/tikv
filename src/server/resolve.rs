@@ -1,15 +1,4 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::boxed::FnBox;
 use std::fmt::{self, Display, Formatter};
@@ -18,31 +7,31 @@ use std::time::Instant;
 
 use kvproto::metapb;
 
-use pd::PdClient;
-use util::collections::HashMap;
-use util::worker::{Runnable, Scheduler, Worker};
+use crate::pd::PdClient;
+use tikv_util::collections::HashMap;
+use tikv_util::worker::{Runnable, Scheduler, Worker};
 
 use super::metrics::*;
 use super::Result;
 
 const STORE_ADDRESS_REFRESH_SECONDS: u64 = 60;
 
-pub type Callback = Box<FnBox(Result<String>) + Send>;
+pub type Callback = Box<dyn FnBox(Result<String>) + Send>;
 
-// StoreAddrResolver resolves the store address.
+/// A trait for resolving store addresses.
 pub trait StoreAddrResolver: Send + Clone {
-    // Resolve resolves the store address asynchronously.
+    /// Resolves the address for the specified store id asynchronously.
     fn resolve(&self, store_id: u64, cb: Callback) -> Result<()>;
 }
 
-/// Snapshot generating task.
+/// A task for resolving store addresses.
 pub struct Task {
     store_id: u64,
     cb: Callback,
 }
 
 impl Display for Task {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "resolve store {} address", self.store_id)
     }
 }
@@ -52,7 +41,8 @@ struct StoreAddr {
     last_update: Instant,
 }
 
-pub struct Runner<T: PdClient> {
+/// A runner for resolving store addresses.
+struct Runner<T: PdClient> {
     pd_client: Arc<T>,
     store_addrs: HashMap<u64, StoreAddr>,
 }
@@ -106,6 +96,7 @@ impl<T: PdClient> Runnable<Task> for Runner<T> {
     }
 }
 
+/// A store address resolver which is backed by a `PDClient`.
 #[derive(Clone)]
 pub struct PdStoreAddrResolver {
     sched: Scheduler<Task>,
@@ -117,6 +108,7 @@ impl PdStoreAddrResolver {
     }
 }
 
+/// Creates a new `PdStoreAddrResolver`.
 pub fn new_resolver<T>(pd_client: Arc<T>) -> Result<(Worker<Task>, PdStoreAddrResolver)>
 where
     T: PdClient + 'static,
@@ -152,11 +144,10 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use crate::pd::{PdClient, PdFuture, RegionStat, Result};
     use kvproto::metapb;
     use kvproto::pdpb;
-    use pd::{PdClient, PdFuture, RegionStat, Result};
-    use util;
-    use util::collections::HashMap;
+    use tikv_util::collections::HashMap;
 
     const STORE_ADDRESS_REFRESH_SECONDS: u64 = 60;
 
@@ -185,7 +176,7 @@ mod tests {
             // The store address will be changed every millisecond.
             let mut store = self.store.clone();
             let mut sock = SocketAddr::from_str(store.get_address()).unwrap();
-            sock.set_port(util::time::duration_to_ms(self.start.elapsed()) as u16);
+            sock.set_port(tikv_util::time::duration_to_ms(self.start.elapsed()) as u16);
             store.set_address(format!("{}:{}", sock.ip(), sock.port()));
             Ok(store)
         }
@@ -229,6 +220,9 @@ mod tests {
             unimplemented!();
         }
         fn report_batch_split(&self, _: Vec<metapb::Region>) -> PdFuture<()> {
+            unimplemented!();
+        }
+        fn get_gc_safe_point(&self) -> PdFuture<u64> {
             unimplemented!();
         }
     }

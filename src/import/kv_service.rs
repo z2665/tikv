@@ -1,29 +1,18 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
 
+use crate::grpc::{ClientStreamingSink, RequestStream, RpcContext, UnarySink};
 use futures::sync::mpsc;
 use futures::{Future, Stream};
 use futures_cpupool::{Builder, CpuPool};
-use grpc::{ClientStreamingSink, RequestStream, RpcContext, UnarySink};
 use kvproto::import_kvpb::*;
 use kvproto::import_kvpb_grpc::*;
 use uuid::Uuid;
 
-use raftstore::store::keys;
-use storage::types::Key;
-use util::time::Instant;
+use crate::raftstore::store::keys;
+use crate::storage::types::Key;
+use tikv_util::time::Instant;
 
 use super::client::*;
 use super::metrics::*;
@@ -51,10 +40,32 @@ impl ImportKVService {
     }
 }
 
+/// ImportKV provides a service to import key-value pairs to TiKV.
+///
+/// In order to import key-value pairs to TiKV, the user should:
+/// 1. Opens an engine identified by a UUID.
+/// 2. Opens a write streams to write key-value batches to the opened engine.
+///    Different streams/clients can write to the same engine concurrently.
+/// 3. Closes the engine after all write batches have been finished. An
+///    engine can only be closed when all write streams are closed. An
+///    engine can only be closed once, and it can not be opened again
+///    once it is closed.
+/// 4. Imports the data in the engine to the target cluster. Note that
+///    the import process is not atomic, and it requires the data to be
+///    idempotent on retry. An engine can only be imported after it is
+///    closed. An engine can be imported multiple times, but can not be
+///    imported concurrently.
+/// 5. Cleans up the engine after it has been imported. Delete all data
+///    in the engine. An engine can not be cleaned up when it is
+///    writing or importing.
 impl ImportKv for ImportKVService {
+    /// Switches the target cluster to normal/import mode.
+    ///
+    /// Under import mode, cluster will stop automatic compaction and
+    /// turn off write stall mechanism.
     fn switch_mode(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: SwitchModeRequest,
         sink: UnarySink<SwitchModeResponse>,
     ) {
@@ -67,11 +78,11 @@ impl ImportKv for ImportKVService {
                     let client = Client::new(req.get_pd_addr(), 1)?;
                     match client.switch_cluster(req.get_request()) {
                         Ok(_) => {
-                            info!("switch cluster {:?}", req.get_request());
+                            info!("switch cluster"; "req" => ?req.get_request());
                             Ok(())
                         }
                         Err(e) => {
-                            error!("switch cluster {:?}: {:?}", req.get_request(), e);
+                            error!("switch cluster failed"; "req" => ?req.get_request(), "err" => %e);
                             Err(e)
                         }
                     }
@@ -82,8 +93,8 @@ impl ImportKv for ImportKVService {
     }
 
     fn open_engine(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: OpenEngineRequest,
         sink: UnarySink<OpenEngineResponse>,
     ) {
@@ -103,8 +114,8 @@ impl ImportKv for ImportKVService {
     }
 
     fn write_engine(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         stream: RequestStream<WriteEngineRequest>,
         sink: ClientStreamingSink<WriteEngineResponse>,
     ) {
@@ -160,8 +171,8 @@ impl ImportKv for ImportKVService {
     }
 
     fn close_engine(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: CloseEngineRequest,
         sink: UnarySink<CloseEngineResponse>,
     ) {
@@ -191,8 +202,8 @@ impl ImportKv for ImportKVService {
     }
 
     fn import_engine(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: ImportEngineRequest,
         sink: UnarySink<ImportEngineResponse>,
     ) {
@@ -212,8 +223,8 @@ impl ImportKv for ImportKVService {
     }
 
     fn cleanup_engine(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: CleanupEngineRequest,
         sink: UnarySink<CleanupEngineResponse>,
     ) {
@@ -232,9 +243,11 @@ impl ImportKv for ImportKVService {
         )
     }
 
+    /// It's recommended to call `compact_cluster` before reading from
+    /// the database, because otherwise the read can be very slow.
     fn compact_cluster(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: CompactClusterRequest,
         sink: UnarySink<CompactClusterResponse>,
     ) {
@@ -260,11 +273,11 @@ impl ImportKv for ImportKVService {
                     let client = Client::new(req.get_pd_addr(), 1)?;
                     match client.compact_cluster(&compact) {
                         Ok(_) => {
-                            info!("compact cluster {:?}", compact);
+                            info!("compact cluster"; "req" => ?compact);
                             Ok(())
                         }
                         Err(e) => {
-                            error!("compact cluster {:?}: {:?}", compact, e);
+                            error!("compact cluster failed"; "req" => ?compact, "err" => %e);
                             Err(e)
                         }
                     }

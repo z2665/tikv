@@ -1,15 +1,4 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
 use std::{i64, mem, u64};
@@ -17,7 +6,7 @@ use std::{i64, mem, u64};
 use tipb::select;
 
 use super::{Error, Result};
-use coprocessor::codec::mysql::Tz;
+use crate::coprocessor::codec::mysql::Tz;
 
 /// Flags are used by `DAGRequest.flags` to handle execution mode, like how to handle
 /// truncate error.
@@ -45,11 +34,28 @@ pub const FLAG_OVERFLOW_AS_WARNING: u64 = 1 << 6;
 // FLAG_DIVIDED_BY_ZERO_AS_WARNING indicates if DividedByZero should be returned as warning.
 pub const FLAG_DIVIDED_BY_ZERO_AS_WARNING: u64 = 1 << 8;
 
-pub const MODE_ERROR_FOR_DIVISION_BY_ZERO: u64 = 27;
+bitflags! {
+    /// Please refer to SQLMode in `mysql/const.go` in repo `pingcap/parser` for details.
+    pub struct SqlMode: u64 {
+        const STRICT_TRANS_TABLES = 1 << 22;
+        const STRICT_ALL_TABLES = 1 << 23;
+        const NO_ZERO_IN_DATE = 1 << 24;
+        const NO_ZERO_DATE = 1 << 25;
+        const INVALID_DATES = 1 << 26;
+        const ERROR_FOR_DIVISION_BY_ZERO = 1 << 27;
+    }
+}
+
+impl SqlMode {
+    /// Returns if 'STRICT_TRANS_TABLES' or 'STRICT_ALL_TABLES' mode is set.
+    pub fn is_strict(self) -> bool {
+        self.contains(SqlMode::STRICT_TRANS_TABLES) || self.contains(SqlMode::STRICT_ALL_TABLES)
+    }
+}
 
 const DEFAULT_MAX_WARNING_CNT: usize = 64;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EvalConfig {
     /// timezone to use when parse/calculate time.
     pub tz: Tz,
@@ -61,10 +67,10 @@ pub struct EvalConfig {
     pub in_select_stmt: bool,
     pub pad_char_to_full_length: bool,
     pub divided_by_zero_as_warning: bool,
+    // TODO: max warning count is not really a EvalConfig. Instead it is a ExecutionConfig, because
+    // warning is a executor stuff instead of a evaluation stuff.
     pub max_warning_cnt: usize,
-    pub sql_mode: u64,
-    /// if the session is in strict mode.
-    pub strict_sql_mode: bool,
+    pub sql_mode: SqlMode,
 }
 
 impl Default for EvalConfig {
@@ -74,8 +80,8 @@ impl Default for EvalConfig {
 }
 
 impl EvalConfig {
-    pub fn new() -> EvalConfig {
-        EvalConfig {
+    pub fn new() -> Self {
+        Self {
             tz: Tz::utc(),
             ignore_truncate: false,
             truncate_as_warning: false,
@@ -86,67 +92,67 @@ impl EvalConfig {
             pad_char_to_full_length: false,
             divided_by_zero_as_warning: false,
             max_warning_cnt: DEFAULT_MAX_WARNING_CNT,
-            sql_mode: 0,
-            strict_sql_mode: false,
+            sql_mode: SqlMode::empty(),
         }
     }
 
-    pub fn set_ignore_truncate(mut self, new_value: bool) -> Self {
+    pub fn from_flags(flags: u64) -> Self {
+        let mut config = Self::new();
+        config.set_by_flags(flags);
+        config
+    }
+
+    pub fn set_ignore_truncate(&mut self, new_value: bool) -> &mut Self {
         self.ignore_truncate = new_value;
         self
     }
 
-    pub fn set_truncate_as_warning(mut self, new_value: bool) -> Self {
+    pub fn set_truncate_as_warning(&mut self, new_value: bool) -> &mut Self {
         self.truncate_as_warning = new_value;
         self
     }
 
-    pub fn set_overflow_as_warning(mut self, new_value: bool) -> Self {
+    pub fn set_overflow_as_warning(&mut self, new_value: bool) -> &mut Self {
         self.overflow_as_warning = new_value;
         self
     }
 
-    pub fn set_in_insert_stmt(mut self, new_value: bool) -> Self {
+    pub fn set_in_insert_stmt(&mut self, new_value: bool) -> &mut Self {
         self.in_insert_stmt = new_value;
         self
     }
 
-    pub fn set_in_update_or_delete_stmt(mut self, new_value: bool) -> Self {
+    pub fn set_in_update_or_delete_stmt(&mut self, new_value: bool) -> &mut Self {
         self.in_update_or_delete_stmt = new_value;
         self
     }
 
-    pub fn set_in_select_stmt(mut self, new_value: bool) -> Self {
+    pub fn set_in_select_stmt(&mut self, new_value: bool) -> &mut Self {
         self.in_select_stmt = new_value;
         self
     }
 
-    pub fn set_pad_char_to_full_length(mut self, new_value: bool) -> Self {
+    pub fn set_pad_char_to_full_length(&mut self, new_value: bool) -> &mut Self {
         self.pad_char_to_full_length = new_value;
         self
     }
 
-    pub fn set_divided_by_zero_as_warning(mut self, new_value: bool) -> Self {
+    pub fn set_divided_by_zero_as_warning(&mut self, new_value: bool) -> &mut Self {
         self.divided_by_zero_as_warning = new_value;
         self
     }
 
-    pub fn set_max_warning_cnt(mut self, new_value: usize) -> Self {
+    pub fn set_max_warning_cnt(&mut self, new_value: usize) -> &mut Self {
         self.max_warning_cnt = new_value;
         self
     }
 
-    pub fn set_sql_mode(mut self, new_value: u64) -> Self {
+    pub fn set_sql_mode(&mut self, new_value: SqlMode) -> &mut Self {
         self.sql_mode = new_value;
         self
     }
 
-    pub fn set_strict_sql_mode(mut self, new_value: bool) -> Self {
-        self.strict_sql_mode = new_value;
-        self
-    }
-
-    pub fn set_time_zone_by_name(mut self, tz_name: &str) -> Result<Self> {
+    pub fn set_time_zone_by_name(&mut self, tz_name: &str) -> Result<&mut Self> {
         match Tz::from_tz_name(tz_name) {
             Some(tz) => {
                 self.tz = tz;
@@ -156,7 +162,7 @@ impl EvalConfig {
         }
     }
 
-    pub fn set_time_zone_by_offset(mut self, offset_sec: i64) -> Result<Self> {
+    pub fn set_time_zone_by_offset(&mut self, offset_sec: i64) -> Result<&mut Self> {
         match Tz::from_offset(offset_sec) {
             Some(tz) => {
                 self.tz = tz;
@@ -166,7 +172,7 @@ impl EvalConfig {
         }
     }
 
-    pub fn set_by_flags(self, flags: u64) -> Self {
+    pub fn set_by_flags(&mut self, flags: u64) -> &mut Self {
         self.set_ignore_truncate((flags & FLAG_IGNORE_TRUNCATE) > 0)
             .set_truncate_as_warning((flags & FLAG_TRUNCATE_AS_WARNING) > 0)
             .set_overflow_as_warning((flags & FLAG_OVERFLOW_AS_WARNING) > 0)
@@ -177,23 +183,20 @@ impl EvalConfig {
             .set_divided_by_zero_as_warning((flags & FLAG_DIVIDED_BY_ZERO_AS_WARNING) > 0)
     }
 
-    /// detects if 'ERROR_FOR_DIVISION_BY_ZERO' mode is set in sql_mode
-    pub fn mode_error_for_division_by_zero(&self) -> bool {
-        self.sql_mode & MODE_ERROR_FOR_DIVISION_BY_ZERO == MODE_ERROR_FOR_DIVISION_BY_ZERO
-    }
-
     pub fn new_eval_warnings(&self) -> EvalWarnings {
         EvalWarnings::new(self.max_warning_cnt)
     }
 
     #[cfg(test)]
     pub fn default_for_test() -> EvalConfig {
-        EvalConfig::new().set_ignore_truncate(true)
+        let mut config = EvalConfig::new();
+        config.set_ignore_truncate(true);
+        config
     }
 }
 
 // Warning details caused in eval computation.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct EvalWarnings {
     // max number of warnings to return.
     max_warning_cnt: usize,
@@ -204,7 +207,7 @@ pub struct EvalWarnings {
 }
 
 impl EvalWarnings {
-    fn new(max_warning_cnt: usize) -> EvalWarnings {
+    pub fn new(max_warning_cnt: usize) -> EvalWarnings {
         EvalWarnings {
             max_warning_cnt,
             warning_cnt: 0,
@@ -219,7 +222,7 @@ impl EvalWarnings {
         }
     }
 
-    pub fn merge(&mut self, mut other: EvalWarnings) {
+    pub fn merge(&mut self, other: &mut EvalWarnings) {
         self.warning_cnt += other.warning_cnt;
         if self.warnings.len() >= self.max_warning_cnt {
             return;
@@ -283,15 +286,32 @@ impl EvalContext {
 
     pub fn handle_division_by_zero(&mut self) -> Result<()> {
         if self.cfg.in_insert_stmt || self.cfg.in_update_or_delete_stmt {
-            if !self.cfg.mode_error_for_division_by_zero() {
+            if !self
+                .cfg
+                .sql_mode
+                .contains(SqlMode::ERROR_FOR_DIVISION_BY_ZERO)
+            {
                 return Ok(());
             }
-            if self.cfg.strict_sql_mode && !self.cfg.divided_by_zero_as_warning {
+            if self.cfg.sql_mode.is_strict() && !self.cfg.divided_by_zero_as_warning {
                 return Err(Error::division_by_zero());
             }
         }
         self.warnings.append_warning(Error::division_by_zero());
         Ok(())
+    }
+
+    pub fn handle_invalid_time_error(&mut self, err: Error) -> Result<()> {
+        if err.code() != super::codec::error::ERR_TRUNCATE_WRONG_VALUE {
+            return Err(err);
+        }
+        let cfg = &self.cfg;
+        if cfg.sql_mode.is_strict() && (cfg.in_insert_stmt || cfg.in_update_or_delete_stmt) {
+            Err(err)
+        } else {
+            self.warnings.append_warning(err);
+            Ok(())
+        }
     }
 
     pub fn overflow_from_cast_str_as_int(
@@ -322,7 +342,8 @@ impl EvalContext {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
+    use super::super::Error;
     use super::*;
     use std::sync::Arc;
 
@@ -340,7 +361,7 @@ mod test {
         assert!(ctx.take_warnings().warnings.is_empty());
 
         // ignore_truncate = false, truncate_as_warning = true
-        let mut ctx = EvalContext::new(Arc::new(EvalConfig::new().set_truncate_as_warning(true)));
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flags(FLAG_TRUNCATE_AS_WARNING)));
         assert!(ctx.handle_truncate(false).is_ok());
         assert!(ctx.handle_truncate(true).is_ok());
         assert!(!ctx.take_warnings().warnings.is_empty());
@@ -348,7 +369,7 @@ mod test {
 
     #[test]
     fn test_max_warning_cnt() {
-        let eval_cfg = Arc::new(EvalConfig::new().set_truncate_as_warning(true));
+        let eval_cfg = Arc::new(EvalConfig::from_flags(FLAG_TRUNCATE_AS_WARNING));
         let mut ctx = EvalContext::new(Arc::clone(&eval_cfg));
         assert!(ctx.handle_truncate(true).is_ok());
         assert!(ctx.handle_truncate(true).is_ok());
@@ -364,45 +385,68 @@ mod test {
     #[test]
     fn test_handle_division_by_zero() {
         let cases = vec![
-            //(flag,sql_mode,strict_sql_mode=>is_ok,is_empty)
-            (0, 0, false, true, false), //warning
+            //(flag,sql_mode,is_ok,is_empty)
+            (0, SqlMode::empty(), true, false), //warning
             (
                 FLAG_IN_INSERT_STMT,
-                MODE_ERROR_FOR_DIVISION_BY_ZERO,
-                false,
+                SqlMode::ERROR_FOR_DIVISION_BY_ZERO,
                 true,
                 false,
             ), //warning
             (
                 FLAG_IN_UPDATE_OR_DELETE_STMT,
-                MODE_ERROR_FOR_DIVISION_BY_ZERO,
-                false,
+                SqlMode::ERROR_FOR_DIVISION_BY_ZERO,
                 true,
                 false,
             ), //warning
             (
                 FLAG_IN_UPDATE_OR_DELETE_STMT,
-                MODE_ERROR_FOR_DIVISION_BY_ZERO,
-                true,
+                SqlMode::ERROR_FOR_DIVISION_BY_ZERO | SqlMode::STRICT_ALL_TABLES,
                 false,
                 true,
             ), //error
-            (FLAG_IN_UPDATE_OR_DELETE_STMT, 0, true, true, true), //ok
+            (
+                FLAG_IN_UPDATE_OR_DELETE_STMT,
+                SqlMode::STRICT_ALL_TABLES,
+                true,
+                true,
+            ), //ok
             (
                 FLAG_IN_UPDATE_OR_DELETE_STMT | FLAG_DIVIDED_BY_ZERO_AS_WARNING,
-                MODE_ERROR_FOR_DIVISION_BY_ZERO,
-                true,
+                SqlMode::ERROR_FOR_DIVISION_BY_ZERO | SqlMode::STRICT_ALL_TABLES,
                 true,
                 false,
             ), //warning
         ];
-        for (flag, sql_mode, strict_sql_mode, is_ok, is_empty) in cases {
-            let cfg = EvalConfig::new()
-                .set_by_flags(flag)
-                .set_sql_mode(sql_mode)
-                .set_strict_sql_mode(strict_sql_mode);
+        for (flag, sql_mode, is_ok, is_empty) in cases {
+            let mut cfg = EvalConfig::new();
+            cfg.set_by_flags(flag).set_sql_mode(sql_mode);
             let mut ctx = EvalContext::new(Arc::new(cfg));
             assert_eq!(ctx.handle_division_by_zero().is_ok(), is_ok);
+            assert_eq!(ctx.take_warnings().warnings.is_empty(), is_empty);
+        }
+    }
+
+    #[test]
+    fn test_handle_invalid_time_error() {
+        let cases = vec![
+            //(flags,strict_sql_mode,is_ok,is_empty)
+            (0, false, true, false),                             //warning
+            (0, true, true, false),                              //warning
+            (FLAG_IN_INSERT_STMT, false, true, false),           //warning
+            (FLAG_IN_UPDATE_OR_DELETE_STMT, false, true, false), //warning
+            (FLAG_IN_UPDATE_OR_DELETE_STMT, true, false, true),  //error
+            (FLAG_IN_INSERT_STMT, true, false, true),            //error
+        ];
+        for (flags, strict_sql_mode, is_ok, is_empty) in cases {
+            let err = Error::invalid_time_format("");
+            let mut cfg = EvalConfig::new();
+            cfg.set_by_flags(flags);
+            if strict_sql_mode {
+                cfg.sql_mode.insert(SqlMode::STRICT_ALL_TABLES);
+            }
+            let mut ctx = EvalContext::new(Arc::new(cfg));
+            assert_eq!(ctx.handle_invalid_time_error(err).is_ok(), is_ok);
             assert_eq!(ctx.take_warnings().warnings.is_empty(), is_empty);
         }
     }

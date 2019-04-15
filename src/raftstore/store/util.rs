@@ -1,17 +1,5 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::Bound::Excluded;
 use std::option::Option;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -19,22 +7,15 @@ use std::{fmt, u64};
 
 use kvproto::metapb;
 use kvproto::raft_cmdpb::{AdminCmdType, RaftCmdRequest};
-use kvproto::raft_serverpb::RaftMessage;
 use protobuf::{self, Message};
 use raft::eraftpb::{self, ConfChangeType, ConfState, MessageType};
-use raftstore::store::keys;
-use raftstore::{Error, Result};
-use rocksdb::{Range, TablePropertiesCollection, Writable, WriteBatch, DB};
+use raft::INVALID_INDEX;
 use time::{Duration, Timespec};
 
-use storage::{Key, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, LARGE_CFS};
-use util::properties::RangeProperties;
-use util::rocksdb::stats::get_range_entries_and_versions;
-use util::time::monotonic_raw_now;
-use util::{rocksdb as rocksdb_util, Either};
-
-use super::engine::{IterOption, Iterable};
 use super::peer_storage;
+use crate::raftstore::{Error, Result};
+use tikv_util::time::monotonic_raw_now;
+use tikv_util::{escape, Either};
 
 pub fn find_peer(region: &metapb::Region, store_id: u64) -> Option<&metapb::Peer> {
     region
@@ -106,10 +87,42 @@ pub fn check_key_in_region(key: &[u8], region: &metapb::Region) -> Result<()> {
     }
 }
 
+/// `is_first_vote_msg` checks `msg` is the first vote (or prevote) message or not. It's used for
+/// when the message is received but there is no such region in `Store::region_peers` and the
+/// region overlaps with others. In this case we should put `msg` into `pending_votes` instead of
+/// create the peer.
 #[inline]
-pub fn is_first_vote_msg(msg: &RaftMessage) -> bool {
-    msg.get_message().get_msg_type() == MessageType::MsgRequestVote
-        && msg.get_message().get_term() == peer_storage::RAFT_INIT_LOG_TERM + 1
+pub fn is_first_vote_msg(msg: &eraftpb::Message) -> bool {
+    match msg.get_msg_type() {
+        MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {
+            msg.get_term() == peer_storage::RAFT_INIT_LOG_TERM + 1
+        }
+        _ => false,
+    }
+}
+
+#[inline]
+pub fn is_vote_msg(msg: &eraftpb::Message) -> bool {
+    let msg_type = msg.get_msg_type();
+    msg_type == MessageType::MsgRequestVote || msg_type == MessageType::MsgRequestPreVote
+}
+
+/// `is_initial_msg` checks whether the `msg` can be used to initialize a new peer or not.
+// There could be two cases:
+// 1. Target peer already exists but has not established communication with leader yet
+// 2. Target peer is added newly due to member change or region split, but it's not
+//    created yet
+// For both cases the region start key and end key are attached in RequestVote and
+// Heartbeat message for the store of that peer to check whether to create a new peer
+// when receiving these messages, or just to wait for a pending region split to perform
+// later.
+#[inline]
+pub fn is_initial_msg(msg: &eraftpb::Message) -> bool {
+    let msg_type = msg.get_msg_type();
+    msg_type == MessageType::MsgRequestVote
+        || msg_type == MessageType::MsgRequestPreVote
+        // the peer has not been known to this leader, it may exist or not.
+        || (msg_type == MessageType::MsgHeartbeat && msg.get_commit() == INVALID_INDEX)
 }
 
 const STR_CONF_CHANGE_ADD_NODE: &str = "AddNode";
@@ -122,82 +135,6 @@ pub fn conf_change_type_str(conf_type: eraftpb::ConfChangeType) -> &'static str 
         ConfChangeType::RemoveNode => STR_CONF_CHANGE_REMOVE_NODE,
         ConfChangeType::AddLearnerNode => STR_CONF_CHANGE_ADDLEARNER_NODE,
     }
-}
-
-const MAX_WRITE_BATCH_SIZE: usize = 4 * 1024 * 1024;
-
-pub fn delete_all_in_range(
-    db: &DB,
-    start_key: &[u8],
-    end_key: &[u8],
-    use_delete_range: bool,
-) -> Result<()> {
-    if start_key >= end_key {
-        return Ok(());
-    }
-
-    for cf in db.cf_names() {
-        delete_all_in_range_cf(db, cf, start_key, end_key, use_delete_range)?;
-    }
-
-    Ok(())
-}
-
-pub fn delete_all_in_range_cf(
-    db: &DB,
-    cf: &str,
-    start_key: &[u8],
-    end_key: &[u8],
-    use_delete_range: bool,
-) -> Result<()> {
-    let handle = rocksdb_util::get_cf_handle(db, cf)?;
-    let mut wb = WriteBatch::new();
-    // Since CF_RAFT and CF_LOCK is usually small, so using
-    // traditional way to cleanup.
-    if use_delete_range && cf != CF_RAFT && cf != CF_LOCK {
-        if cf == CF_WRITE {
-            let start = Key::from_encoded_slice(start_key).append_ts(u64::MAX);
-            wb.delete_range_cf(handle, start.as_encoded(), end_key)?;
-        } else {
-            wb.delete_range_cf(handle, start_key, end_key)?;
-        }
-    } else {
-        let iter_opt = IterOption::new(Some(start_key.to_vec()), Some(end_key.to_vec()), false);
-        let mut it = db.new_iterator_cf(cf, iter_opt)?;
-        it.seek(start_key.into());
-        while it.valid() {
-            wb.delete_cf(handle, it.key())?;
-            if wb.data_size() >= MAX_WRITE_BATCH_SIZE {
-                // Can't use write_without_wal here.
-                // Otherwise it may cause dirty data when applying snapshot.
-                db.write(wb)?;
-                wb = WriteBatch::new();
-            }
-
-            if !it.next() {
-                break;
-            }
-        }
-    }
-
-    if wb.count() > 0 {
-        db.write(wb)?;
-    }
-
-    Ok(())
-}
-
-pub fn delete_all_files_in_range(db: &DB, start_key: &[u8], end_key: &[u8]) -> Result<()> {
-    if start_key >= end_key {
-        return Ok(());
-    }
-
-    for cf in db.cf_names() {
-        let handle = rocksdb_util::get_cf_handle(db, cf)?;
-        db.delete_files_in_range_cf(handle, start_key, end_key, false)?;
-    }
-
-    Ok(())
 }
 
 // check whether epoch is staler than check_epoch.
@@ -221,9 +158,10 @@ pub fn check_region_epoch(
             | AdminCmdType::InvalidAdmin
             | AdminCmdType::ComputeHash
             | AdminCmdType::VerifyHash => {}
-            AdminCmdType::Split | AdminCmdType::BatchSplit => check_ver = true,
             AdminCmdType::ChangePeer => check_conf_ver = true,
-            AdminCmdType::PrepareMerge
+            AdminCmdType::Split
+            | AdminCmdType::BatchSplit
+            | AdminCmdType::PrepareMerge
             | AdminCmdType::CommitMerge
             | AdminCmdType::RollbackMerge
             | AdminCmdType::TransferLeader => {
@@ -242,29 +180,37 @@ pub fn check_region_epoch(
     }
 
     let from_epoch = req.get_header().get_region_epoch();
-    let latest_epoch = region.get_region_epoch();
+    let current_epoch = region.get_region_epoch();
 
-    // should we use not equal here?
-    if (check_conf_ver && from_epoch.get_conf_ver() < latest_epoch.get_conf_ver())
-        || (check_ver && from_epoch.get_version() < latest_epoch.get_version())
+    // We must check epochs strictly to avoid key not in region error.
+    //
+    // A 3 nodes TiKV cluster with merge enabled, after commit merge, TiKV A
+    // tells TiDB with a epoch not match error contains the latest target Region
+    // info, TiDB updates its region cache and sends requests to TiKV B,
+    // and TiKV B has not applied commit merge yet, since the region epoch in
+    // request is higher than TiKV B, the request must be denied due to epoch
+    // not match, so it does not read on a stale snapshot, thus avoid the
+    // KeyNotInRegion error.
+    if (check_conf_ver && from_epoch.get_conf_ver() != current_epoch.get_conf_ver())
+        || (check_ver && from_epoch.get_version() != current_epoch.get_version())
     {
         debug!(
-            "[region {}] received stale epoch {:?}, mine: {:?}",
-            region.get_id(),
-            from_epoch,
-            latest_epoch
+            "epoch not match";
+            "region_id" => region.get_id(),
+            "from_epoch" => ?from_epoch,
+            "current_epoch" => ?current_epoch,
         );
         let regions = if include_region {
             vec![region.to_owned()]
         } else {
             vec![]
         };
-        return Err(Error::StaleEpoch(
+        return Err(Error::EpochNotMatch(
             format!(
-                "latest_epoch of region {} is {:?}, but you \
+                "current epoch of region {} is {:?}, but you \
                  sent {:?}",
                 region.get_id(),
-                latest_epoch,
+                current_epoch,
                 from_epoch
             ),
             regions,
@@ -308,136 +254,6 @@ pub fn check_peer_id(req: &RaftCmdRequest, peer_id: u64) -> Result<()> {
             peer_id
         ))
     }
-}
-
-pub fn get_region_properties_cf(
-    db: &DB,
-    cfname: &str,
-    region: &metapb::Region,
-) -> Result<TablePropertiesCollection> {
-    let cf = rocksdb_util::get_cf_handle(db, cfname)?;
-    let start = keys::enc_start_key(region);
-    let end = keys::enc_end_key(region);
-    let range = Range::new(&start, &end);
-    db.get_properties_of_tables_in_range(cf, &[range])
-        .map_err(|e| e.into())
-}
-
-pub fn get_region_approximate_size_cf(
-    db: &DB,
-    cfname: &str,
-    region: &metapb::Region,
-) -> Result<u64> {
-    let cf = rocksdb_util::get_cf_handle(db, cfname)?;
-    let start = keys::enc_start_key(region);
-    let end = keys::enc_end_key(region);
-    let range = Range::new(&start, &end);
-    let (_, mut size) = db.get_approximate_memtable_stats_cf(cf, &range);
-    let collection = db.get_properties_of_tables_in_range(cf, &[range])?;
-    for (_, v) in &*collection {
-        let props = RangeProperties::decode(v.user_collected_properties())?;
-        size += props.get_approximate_size_in_range(&start, &end);
-    }
-    Ok(size)
-}
-
-pub fn get_region_approximate_keys_cf(
-    db: &DB,
-    cfname: &str,
-    region: &metapb::Region,
-) -> Result<u64> {
-    let cf = rocksdb_util::get_cf_handle(db, cfname)?;
-    let start = keys::enc_start_key(region);
-    let end = keys::enc_end_key(region);
-    let range = Range::new(&start, &end);
-    let (mut keys, _) = db.get_approximate_memtable_stats_cf(cf, &range);
-    let collection = db.get_properties_of_tables_in_range(cf, &[range])?;
-    for (_, v) in &*collection {
-        let props = RangeProperties::decode(v.user_collected_properties())?;
-        keys += props.get_approximate_keys_in_range(&start, &end);
-    }
-    Ok(keys)
-}
-
-/// Get the approxmiate middle key of the region. If we suppose the region
-/// is stored on disk as a plain file, "middle key" means the key whose
-/// position is in the middle of the file.
-///
-/// The returned key maybe is timestamped if transaction KV is used,
-/// and must start with "z".
-pub fn get_region_approximate_middle_cf(
-    db: &DB,
-    cfname: &str,
-    region: &metapb::Region,
-) -> Result<Option<Vec<u8>>> {
-    let cf = rocksdb_util::get_cf_handle(db, cfname)?;
-    let start = keys::enc_start_key(region);
-    let end = keys::enc_end_key(region);
-    let range = Range::new(&start, &end);
-    let collection = db.get_properties_of_tables_in_range(cf, &[range])?;
-
-    let mut keys = Vec::new();
-    for (_, v) in &*collection {
-        let props = RangeProperties::decode(v.user_collected_properties())?;
-        keys.extend(
-            props
-                .offsets
-                .range::<[u8], _>((Excluded(start.as_slice()), Excluded(end.as_slice())))
-                .map(|(k, _)| k.to_owned()),
-        );
-    }
-    keys.sort();
-    if keys.is_empty() {
-        return Ok(None);
-    }
-    // Calculate the position by (len-1)/2. So it's the left one
-    // of two middle positions if the number of keys is even.
-    let middle = (keys.len() - 1) / 2;
-    Ok(Some(keys.swap_remove(middle)))
-}
-
-pub fn get_region_approximate_size(db: &DB, region: &metapb::Region) -> Result<u64> {
-    let mut size = 0;
-    for cfname in LARGE_CFS {
-        size += get_region_approximate_size_cf(db, cfname, region)?
-    }
-    Ok(size)
-}
-
-/// Get the approximate number of keys in the region.
-pub fn get_region_approximate_keys(db: &DB, region: &metapb::Region) -> Result<u64> {
-    // try to get from RangeProperties first.
-    match get_region_approximate_keys_cf(db, CF_WRITE, region) {
-        Ok(v) => if v > 0 {
-            return Ok(v);
-        },
-        Err(e) => debug!(
-            "old_version:get keys from RangeProperties failed with err:{:?}",
-            e
-        ),
-    }
-
-    let cf = rocksdb_util::get_cf_handle(db, CF_WRITE)?;
-    let start = keys::enc_start_key(region);
-    let end = keys::enc_end_key(region);
-    let (_, keys) = get_range_entries_and_versions(db, cf, &start, &end).unwrap_or_default();
-    Ok(keys)
-}
-
-/// Get region approximate middle key based on default and write cf size.
-pub fn get_region_approximate_middle(db: &DB, region: &metapb::Region) -> Result<Option<Vec<u8>>> {
-    let get_cf_size = |cf: &str| get_region_approximate_size_cf(db, cf, &region);
-
-    let default_cf_size = box_try!(get_cf_size(CF_DEFAULT));
-    let write_cf_size = box_try!(get_cf_size(CF_WRITE));
-
-    let middle_by_cf = if default_cf_size >= write_cf_size {
-        CF_DEFAULT
-    } else {
-        CF_WRITE
-    };
-
-    get_region_approximate_middle_cf(db, middle_by_cf, &region)
 }
 
 /// Check if replicas of two regions are on the same stores.
@@ -535,9 +351,11 @@ impl Lease {
         let bound = self.next_expired_time(send_ts);
         match self.bound {
             // Longer than suspect ts or longer than valid ts.
-            Some(Either::Left(ts)) | Some(Either::Right(ts)) => if ts <= bound {
-                self.bound = Some(Either::Right(bound));
-            },
+            Some(Either::Left(ts)) | Some(Either::Right(ts)) => {
+                if ts <= bound {
+                    self.bound = Some(Either::Right(bound));
+                }
+            }
             // Or an empty lease
             None => {
                 self.bound = Some(Either::Right(bound));
@@ -565,11 +383,13 @@ impl Lease {
     pub fn inspect(&self, ts: Option<Timespec>) -> LeaseState {
         match self.bound {
             Some(Either::Left(_)) => LeaseState::Suspect,
-            Some(Either::Right(bound)) => if ts.unwrap_or_else(monotonic_raw_now) < bound {
-                LeaseState::Valid
-            } else {
-                LeaseState::Expired
-            },
+            Some(Either::Right(bound)) => {
+                if ts.unwrap_or_else(monotonic_raw_now) < bound {
+                    LeaseState::Valid
+                } else {
+                    LeaseState::Expired
+                }
+            }
             None => LeaseState::Expired,
         }
     }
@@ -617,7 +437,7 @@ impl Lease {
 }
 
 impl fmt::Debug for Lease {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut fmter = fmt.debug_struct("Lease");
         match self.bound {
             Some(Either::Left(ts)) => fmter.field("suspect", &ts).finish(),
@@ -630,7 +450,6 @@ impl fmt::Debug for Lease {
 /// A remote lease, it can only be derived by `Lease`. It will be sent
 /// to the local read thread, so name it remote. If Lease expires, the remote must
 /// expire too.
-#[derive(Debug)]
 pub struct RemoteLease {
     expired_time: Arc<AtomicU64>,
     term: u64,
@@ -657,6 +476,18 @@ impl RemoteLease {
 
     pub fn term(&self) -> u64 {
         self.term
+    }
+}
+
+impl fmt::Debug for RemoteLease {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("RemoteLease")
+            .field(
+                "expired_time",
+                &u64_to_timespec(self.expired_time.load(AtomicOrdering::Relaxed)),
+            )
+            .field("term", &self.term)
+            .finish()
     }
 }
 
@@ -749,40 +580,35 @@ pub fn conf_state_from_region(region: &metapb::Region) -> ConfState {
     conf_state
 }
 
-#[derive(Clone, Debug)]
-pub struct Engines {
-    pub kv: Arc<DB>,
-    pub raft: Arc<DB>,
-}
+pub struct KeysInfoFormatter<'a>(pub &'a [Vec<u8>]);
 
-impl Engines {
-    pub fn new(kv_engine: Arc<DB>, raft_engine: Arc<DB>) -> Engines {
-        Engines {
-            kv: kv_engine,
-            raft: raft_engine,
+impl<'a> fmt::Display for KeysInfoFormatter<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.len() {
+            0 => write!(f, "no key"),
+            1 => write!(f, "key \"{}\"", escape(self.0.first().unwrap())),
+            _ => write!(
+                f,
+                "{} keys range from \"{}\" to \"{}\"",
+                self.0.len(),
+                escape(self.0.first().unwrap()),
+                escape(self.0.last().unwrap())
+            ),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{iter, process, thread};
+    use std::thread;
 
     use kvproto::metapb::{self, RegionEpoch};
     use kvproto::raft_cmdpb::AdminRequest;
-    use kvproto::raft_serverpb::RaftMessage;
     use raft::eraftpb::{ConfChangeType, Message, MessageType};
-    use rocksdb::{ColumnFamilyOptions, DBOptions, SeekKey, Writable, WriteBatch, DB};
-    use tempdir::TempDir;
     use time::Duration as TimeDuration;
 
-    use raftstore::store::peer_storage;
-    use storage::mvcc::{Write, WriteType};
-    use storage::{Key, ALL_CFS, CF_DEFAULT};
-    use util::escape;
-    use util::properties::{MvccPropertiesCollectorFactory, RangePropertiesCollectorFactory};
-    use util::rocksdb::{get_cf_handle, new_engine_opt, CFOptions};
-    use util::time::{monotonic_now, monotonic_raw_now};
+    use crate::raftstore::store::peer_storage;
+    use tikv_util::time::{monotonic_now, monotonic_raw_now};
 
     use super::*;
 
@@ -988,7 +814,17 @@ mod tests {
                 true,
             ),
             (
+                MessageType::MsgRequestPreVote,
+                peer_storage::RAFT_INIT_LOG_TERM + 1,
+                true,
+            ),
+            (
                 MessageType::MsgRequestVote,
+                peer_storage::RAFT_INIT_LOG_TERM,
+                false,
+            ),
+            (
+                MessageType::MsgRequestPreVote,
                 peer_storage::RAFT_INIT_LOG_TERM,
                 false,
             ),
@@ -1003,10 +839,25 @@ mod tests {
             let mut msg = Message::new();
             msg.set_msg_type(msg_type);
             msg.set_term(term);
+            assert_eq!(is_first_vote_msg(&msg), is_vote);
+        }
+    }
 
-            let mut m = RaftMessage::new();
-            m.set_message(msg);
-            assert_eq!(is_first_vote_msg(&m), is_vote);
+    #[test]
+    fn test_is_initial_msg() {
+        let tbl = vec![
+            (MessageType::MsgRequestVote, INVALID_INDEX, true),
+            (MessageType::MsgRequestPreVote, INVALID_INDEX, true),
+            (MessageType::MsgHeartbeat, INVALID_INDEX, true),
+            (MessageType::MsgHeartbeat, 100, false),
+            (MessageType::MsgAppend, 100, false),
+        ];
+
+        for (msg_type, commit, can_create) in tbl {
+            let mut msg = Message::new();
+            msg.set_msg_type(msg_type);
+            msg.set_commit(commit);
+            assert_eq!(is_initial_msg(&msg), can_create);
         }
     }
 
@@ -1041,239 +892,6 @@ mod tests {
             check_epoch.set_conf_ver(conf_version);
             assert_eq!(is_epoch_stale(&epoch, &check_epoch), is_stale);
         }
-    }
-
-    fn make_region(id: u64, start_key: Vec<u8>, end_key: Vec<u8>) -> metapb::Region {
-        let mut peer = metapb::Peer::new();
-        peer.set_id(id);
-        peer.set_store_id(id);
-        let mut region = metapb::Region::new();
-        region.set_id(id);
-        region.set_start_key(start_key);
-        region.set_end_key(end_key);
-        region.mut_peers().push(peer);
-        region
-    }
-
-    #[test]
-    fn test_region_approximate_keys() {
-        let path = TempDir::new("_test_region_approximate_keys").expect("");
-        let path_str = path.path().to_str().unwrap();
-        let db_opts = DBOptions::new();
-        let mut cf_opts = ColumnFamilyOptions::new();
-        cf_opts.set_level_zero_file_num_compaction_trigger(10);
-        let f = Box::new(MvccPropertiesCollectorFactory::default());
-        cf_opts.add_table_properties_collector_factory("tikv.mvcc-properties-collector", f);
-        let cfs_opts = LARGE_CFS
-            .iter()
-            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
-            .collect();
-        let db = rocksdb_util::new_engine_opt(path_str, db_opts, cfs_opts).unwrap();
-
-        let cases = [("a", 1024), ("b", 2048), ("c", 4096)];
-        for &(key, vlen) in &cases {
-            let key = keys::data_key(Key::from_raw(key.as_bytes()).append_ts(2).as_encoded());
-            let write_v = Write::new(WriteType::Put, 0, None).to_bytes();
-            let write_cf = db.cf_handle(CF_WRITE).unwrap();
-            db.put_cf(write_cf, &key, &write_v).unwrap();
-            db.flush_cf(write_cf, true).unwrap();
-
-            let default_v = vec![0; vlen as usize];
-            let default_cf = db.cf_handle(CF_DEFAULT).unwrap();
-            db.put_cf(default_cf, &key, &default_v).unwrap();
-            db.flush_cf(default_cf, true).unwrap();
-        }
-
-        let region = make_region(1, vec![], vec![]);
-        let region_keys = get_region_approximate_keys(&db, &region).unwrap();
-        assert_eq!(region_keys, cases.len() as u64);
-    }
-
-    #[test]
-    fn test_region_approximate_size() {
-        let path = TempDir::new("_test_raftstore_region_approximate_size").expect("");
-        let path_str = path.path().to_str().unwrap();
-        let db_opts = DBOptions::new();
-        let mut cf_opts = ColumnFamilyOptions::new();
-        cf_opts.set_level_zero_file_num_compaction_trigger(10);
-        let f = Box::new(RangePropertiesCollectorFactory::default());
-        cf_opts.add_table_properties_collector_factory("tikv.range-collector", f);
-        let cfs_opts = LARGE_CFS
-            .iter()
-            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
-            .collect();
-        let db = rocksdb_util::new_engine_opt(path_str, db_opts, cfs_opts).unwrap();
-
-        let cases = [("a", 1024), ("b", 2048), ("c", 4096)];
-        let cf_size = 2 + 1024 + 2 + 2048 + 2 + 4096;
-        for &(key, vlen) in &cases {
-            for cfname in LARGE_CFS {
-                let k1 = keys::data_key(key.as_bytes());
-                let v1 = vec![0; vlen as usize];
-                assert_eq!(k1.len(), 2);
-                let cf = db.cf_handle(cfname).unwrap();
-                db.put_cf(cf, &k1, &v1).unwrap();
-                db.flush_cf(cf, true).unwrap();
-            }
-        }
-
-        let region = make_region(1, vec![], vec![]);
-        let size = get_region_approximate_size(&db, &region).unwrap();
-        assert_eq!(size, cf_size * LARGE_CFS.len() as u64);
-        for cfname in LARGE_CFS {
-            let size = get_region_approximate_size_cf(&db, cfname, &region).unwrap();
-            assert_eq!(size, cf_size);
-        }
-    }
-
-    fn check_data(db: &DB, cfs: &[&str], expected: &[(&[u8], &[u8])]) {
-        for cf in cfs {
-            let handle = get_cf_handle(db, cf).unwrap();
-            let mut iter = db.iter_cf(handle);
-            iter.seek(SeekKey::Start);
-            for &(k, v) in expected {
-                assert_eq!(k, iter.key());
-                assert_eq!(v, iter.value());
-                iter.next();
-            }
-            assert!(!iter.valid());
-        }
-    }
-
-    fn test_delete_all_in_range(use_delete_range: bool) {
-        let path = TempDir::new("_raftstore_util_delete_all_in_range").expect("");
-        let path_str = path.path().to_str().unwrap();
-
-        let cfs_opts = ALL_CFS
-            .into_iter()
-            .map(|cf| CFOptions::new(cf, ColumnFamilyOptions::new()))
-            .collect();
-        let db = new_engine_opt(path_str, DBOptions::new(), cfs_opts).unwrap();
-
-        let wb = WriteBatch::new();
-        let ts: u64 = 12345;
-        let keys = vec![
-            Key::from_raw(b"k1").append_ts(ts),
-            Key::from_raw(b"k2").append_ts(ts),
-            Key::from_raw(b"k3").append_ts(ts),
-            Key::from_raw(b"k4").append_ts(ts),
-        ];
-
-        let mut kvs: Vec<(&[u8], &[u8])> = vec![];
-        for (_, key) in keys.iter().enumerate() {
-            kvs.push((key.as_encoded().as_slice(), b"value"));
-        }
-        let kvs_left: Vec<(&[u8], &[u8])> = vec![(kvs[0].0, kvs[0].1), (kvs[3].0, kvs[3].1)];
-        for &(k, v) in kvs.as_slice() {
-            for cf in ALL_CFS {
-                let handle = get_cf_handle(&db, cf).unwrap();
-                wb.put_cf(handle, k, v).unwrap();
-            }
-        }
-        db.write(wb).unwrap();
-        check_data(&db, ALL_CFS, kvs.as_slice());
-
-        // Delete all in ["k2", "k4").
-        let start = Key::from_raw(b"k2");
-        let end = Key::from_raw(b"k4");
-        delete_all_in_range(
-            &db,
-            start.as_encoded().as_slice(),
-            end.as_encoded().as_slice(),
-            use_delete_range,
-        ).unwrap();
-        check_data(&db, ALL_CFS, kvs_left.as_slice());
-    }
-
-    #[test]
-    fn test_delete_all_in_range_use_delete_range() {
-        test_delete_all_in_range(true);
-    }
-
-    #[test]
-    fn test_delete_all_in_range_not_use_delete_range() {
-        test_delete_all_in_range(false);
-    }
-
-    #[test]
-    fn test_delete_all_files_in_range() {
-        let path = TempDir::new("_raftstore_util_delete_all_files_in_range").expect("");
-        let path_str = path.path().to_str().unwrap();
-
-        let cfs_opts = ALL_CFS
-            .into_iter()
-            .map(|cf| {
-                let mut cf_opts = ColumnFamilyOptions::new();
-                cf_opts.set_level_zero_file_num_compaction_trigger(1);
-                CFOptions::new(cf, cf_opts)
-            })
-            .collect();
-        let db = new_engine_opt(path_str, DBOptions::new(), cfs_opts).unwrap();
-
-        let keys = vec![b"k1", b"k2", b"k3", b"k4"];
-
-        let mut kvs: Vec<(&[u8], &[u8])> = vec![];
-        for key in keys {
-            kvs.push((key, b"value"));
-        }
-        let kvs_left: Vec<(&[u8], &[u8])> = vec![(kvs[0].0, kvs[0].1), (kvs[3].0, kvs[3].1)];
-        for cf in ALL_CFS {
-            let handle = get_cf_handle(&db, cf).unwrap();
-            for &(k, v) in kvs.as_slice() {
-                db.put_cf(handle, k, v).unwrap();
-                db.flush_cf(handle, true).unwrap();
-            }
-        }
-        check_data(&db, ALL_CFS, kvs.as_slice());
-
-        delete_all_files_in_range(&db, b"k2", b"k4").unwrap();
-        check_data(&db, ALL_CFS, kvs_left.as_slice());
-    }
-
-    fn exit_with_err(msg: String) -> ! {
-        error!("{}", msg);
-        process::exit(1)
-    }
-
-    #[test]
-    fn test_delete_range_prefix_bloom_case() {
-        let path = TempDir::new("_raftstore_util_delete_range_prefix_bloom").expect("");
-        let path_str = path.path().to_str().unwrap();
-
-        let mut opts = DBOptions::new();
-        opts.create_if_missing(true);
-
-        let mut cf_opts = ColumnFamilyOptions::new();
-        // Prefix extractor(trim the timestamp at tail) for write cf.
-        cf_opts
-            .set_prefix_extractor(
-                "FixedSuffixSliceTransform",
-                Box::new(rocksdb_util::FixedSuffixSliceTransform::new(8)),
-            )
-            .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
-        // Create prefix bloom filter for memtable.
-        cf_opts.set_memtable_prefix_bloom_size_ratio(0.1 as f64);
-        let cf = "default";
-        let db = DB::open_cf(opts, path_str, vec![(cf, cf_opts)]).unwrap();
-        let wb = WriteBatch::new();
-        let kvs: Vec<(&[u8], &[u8])> = vec![
-            (b"kabcdefg1", b"v1"),
-            (b"kabcdefg2", b"v2"),
-            (b"kabcdefg3", b"v3"),
-            (b"kabcdefg4", b"v4"),
-        ];
-        let kvs_left: Vec<(&[u8], &[u8])> = vec![(b"kabcdefg1", b"v1"), (b"kabcdefg4", b"v4")];
-
-        for &(k, v) in kvs.as_slice() {
-            let handle = get_cf_handle(&db, cf).unwrap();
-            wb.put_cf(handle, k, v).unwrap();
-        }
-        db.write(wb).unwrap();
-        check_data(&db, &[cf], kvs.as_slice());
-
-        // Delete all in ["k2", "k4").
-        delete_all_in_range(&db, b"kabcdefg2", b"kabcdefg4", true).unwrap();
-        check_data(&db, &[cf], kvs_left.as_slice());
     }
 
     #[test]
@@ -1405,6 +1023,7 @@ mod tests {
         // These admin commands requires epoch.version.
         for ty in &[
             AdminCmdType::Split,
+            AdminCmdType::BatchSplit,
             AdminCmdType::PrepareMerge,
             AdminCmdType::CommitMerge,
             AdminCmdType::RollbackMerge,
@@ -1425,12 +1044,20 @@ mod tests {
             req.mut_header()
                 .set_region_epoch(stale_version_epoch.clone());
             check_region_epoch(&req, &stale_region, false).unwrap();
-            check_region_epoch(&req, &region, false).unwrap_err();
-            check_region_epoch(&req, &region, true).unwrap_err();
+
+            let mut latest_version_epoch = epoch.clone();
+            latest_version_epoch.set_version(3);
+            for epoch in &[stale_version_epoch, latest_version_epoch] {
+                req.mut_header().set_region_epoch(epoch.clone());
+                check_region_epoch(&req, &region, false).unwrap_err();
+                check_region_epoch(&req, &region, true).unwrap_err();
+            }
         }
 
         // These admin commands requires epoch.conf_version.
         for ty in &[
+            AdminCmdType::Split,
+            AdminCmdType::BatchSplit,
             AdminCmdType::ChangePeer,
             AdminCmdType::PrepareMerge,
             AdminCmdType::CommitMerge,
@@ -1451,46 +1078,14 @@ mod tests {
             stale_region.set_region_epoch(stale_conf_epoch.clone());
             req.mut_header().set_region_epoch(stale_conf_epoch.clone());
             check_region_epoch(&req, &stale_region, false).unwrap();
-            check_region_epoch(&req, &region, false).unwrap_err();
-            check_region_epoch(&req, &region, true).unwrap_err();
+
+            let mut latest_conf_epoch = epoch.clone();
+            latest_conf_epoch.set_conf_ver(3);
+            for epoch in &[stale_conf_epoch, latest_conf_epoch] {
+                req.mut_header().set_region_epoch(epoch.clone());
+                check_region_epoch(&req, &region, false).unwrap_err();
+                check_region_epoch(&req, &region, true).unwrap_err();
+            }
         }
-    }
-
-    #[test]
-    fn test_get_region_approximate_middle_cf() {
-        let tmp = TempDir::new("test_raftstore_util").unwrap();
-        let path = tmp.path().to_str().unwrap();
-
-        let db_opts = DBOptions::new();
-        let mut cf_opts = ColumnFamilyOptions::new();
-        cf_opts.set_level_zero_file_num_compaction_trigger(10);
-        let f = Box::new(RangePropertiesCollectorFactory::default());
-        cf_opts.add_table_properties_collector_factory("tikv.size-collector", f);
-        let cfs_opts = LARGE_CFS
-            .iter()
-            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
-            .collect();
-        let engine = rocksdb_util::new_engine_opt(path, db_opts, cfs_opts).unwrap();
-
-        let cf_handle = engine.cf_handle(CF_DEFAULT).unwrap();
-        let mut big_value = Vec::with_capacity(256);
-        big_value.extend(iter::repeat(b'v').take(256));
-        for i in 0..100 {
-            let k = format!("key_{:03}", i).into_bytes();
-            let k = keys::data_key(Key::from_raw(&k).as_encoded());
-            engine.put_cf(cf_handle, &k, &big_value).unwrap();
-            // Flush for every key so that we can know the exact middle key.
-            engine.flush_cf(cf_handle, true).unwrap();
-        }
-
-        let region = make_region(1, vec![], vec![]);
-        let middle_key = get_region_approximate_middle_cf(&engine, CF_DEFAULT, &region)
-            .unwrap()
-            .unwrap();
-
-        let middle_key = Key::from_encoded_slice(keys::origin_key(&middle_key))
-            .into_raw()
-            .unwrap();
-        assert_eq!(escape(&middle_key), "key_049");
     }
 }

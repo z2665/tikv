@@ -1,20 +1,9 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::{Error, EvalContext, Expression, Result, ScalarFunc};
-use coprocessor::codec::mysql::json::{parse_json_path_expr, ModifyType, PathExpression};
-use coprocessor::codec::mysql::Json;
-use coprocessor::codec::Datum;
+use crate::coprocessor::codec::mysql::json::{parse_json_path_expr, ModifyType, PathExpression};
+use crate::coprocessor::codec::mysql::Json;
+use crate::coprocessor::codec::Datum;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
@@ -47,12 +36,11 @@ impl ScalarFunc {
         row: &'a [Datum],
     ) -> Result<Option<Cow<'a, Json>>> {
         let parser = JsonFuncArgsParser::new(row);
-        let elems = try_opt!(
-            self.children
-                .iter()
-                .map(|e| parser.get_json(ctx, e))
-                .collect()
-        );
+        let elems = try_opt!(self
+            .children
+            .iter()
+            .map(|e| parser.get_json(ctx, e))
+            .collect());
         Ok(Some(Cow::Owned(Json::Array(elems))))
     }
 
@@ -199,11 +187,11 @@ impl<'a> JsonFuncArgsParser<'a> {
 }
 
 #[cfg(test)]
-mod test {
-    use coprocessor::codec::mysql::Json;
-    use coprocessor::codec::Datum;
-    use coprocessor::dag::expr::test::{datum_expr, make_null_datums, scalar_func_expr};
-    use coprocessor::dag::expr::{EvalContext, Expression};
+mod tests {
+    use crate::coprocessor::codec::mysql::Json;
+    use crate::coprocessor::codec::Datum;
+    use crate::coprocessor::dag::expr::tests::{datum_expr, make_null_datums, scalar_func_expr};
+    use crate::coprocessor::dag::expr::{EvalContext, Expression};
     use tipb::expression::ScalarFuncSig;
 
     #[test]
@@ -231,7 +219,7 @@ mod test {
 
             let arg = datum_expr(input);
             let op = scalar_func_expr(ScalarFuncSig::JsonTypeSig, &[arg]);
-            let op = Expression::build(&mut ctx, op).unwrap();
+            let op = Expression::build(&ctx, op).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             assert_eq!(got, exp);
         }
@@ -256,11 +244,13 @@ mod test {
         for (input, parse, exp) in cases {
             let input = match input {
                 None => Datum::Null,
-                Some(s) => if parse {
-                    Datum::Json(s.parse().unwrap())
-                } else {
-                    Datum::Json(Json::String(s.to_owned()))
-                },
+                Some(s) => {
+                    if parse {
+                        Datum::Json(s.parse().unwrap())
+                    } else {
+                        Datum::Json(Json::String(s.to_owned()))
+                    }
+                }
             };
             let exp = match exp {
                 None => Datum::Null,
@@ -269,7 +259,7 @@ mod test {
 
             let arg = datum_expr(input);
             let op = scalar_func_expr(ScalarFuncSig::JsonUnquoteSig, &[arg]);
-            let op = Expression::build(&mut ctx, op).unwrap();
+            let op = Expression::build(&ctx, op).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             assert_eq!(got, exp);
         }
@@ -299,7 +289,7 @@ mod test {
         for (inputs, exp) in cases {
             let args = inputs.into_iter().map(datum_expr).collect::<Vec<_>>();
             let op = scalar_func_expr(ScalarFuncSig::JsonObjectSig, &args);
-            let op = Expression::build(&mut ctx, op).unwrap();
+            let op = Expression::build(&ctx, op).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             assert_eq!(got, exp);
         }
@@ -329,7 +319,7 @@ mod test {
         for (inputs, exp) in cases {
             let args = inputs.into_iter().map(datum_expr).collect::<Vec<_>>();
             let op = scalar_func_expr(ScalarFuncSig::JsonArraySig, &args);
-            let op = Expression::build(&mut ctx, op).unwrap();
+            let op = Expression::build(&ctx, op).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             assert_eq!(got, exp);
         }
@@ -384,7 +374,7 @@ mod test {
         for (sig, inputs, exp) in cases {
             let args: Vec<_> = inputs.into_iter().map(datum_expr).collect();
             let op = scalar_func_expr(sig, &args);
-            let op = Expression::build(&mut ctx, op).unwrap();
+            let op = Expression::build(&ctx, op).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             assert_eq!(got, exp);
         }
@@ -415,7 +405,7 @@ mod test {
         for (inputs, exp) in cases {
             let args: Vec<_> = inputs.into_iter().map(datum_expr).collect();
             let op = scalar_func_expr(ScalarFuncSig::JsonMergeSig, &args);
-            let op = Expression::build(&mut ctx, op).unwrap();
+            let op = Expression::build(&ctx, op).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             assert_eq!(got, exp);
         }
@@ -429,10 +419,10 @@ mod test {
             (ScalarFuncSig::JsonInsertSig, make_null_datums(6)),
             (ScalarFuncSig::JsonReplaceSig, make_null_datums(8)),
         ];
-        let mut ctx = EvalContext::default();
+        let ctx = EvalContext::default();
         for (sig, args) in cases {
             let args: Vec<_> = args.into_iter().map(datum_expr).collect();
-            let op = Expression::build(&mut ctx, scalar_func_expr(sig, &args));
+            let op = Expression::build(&ctx, scalar_func_expr(sig, &args));
             assert!(op.is_err());
         }
     }

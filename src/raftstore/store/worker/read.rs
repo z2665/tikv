@@ -1,42 +1,30 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cell::RefCell;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crossbeam::TrySendError;
 use kvproto::errorpb;
 use kvproto::metapb;
 use kvproto::raft_cmdpb::{CmdType, RaftCmdRequest, RaftCmdResponse};
-use mio;
 use prometheus::local::LocalHistogram;
-use rocksdb::DB;
 use time::Timespec;
 
-use raftstore::errors::RAFTSTORE_IS_BUSY;
-use raftstore::store::msg::Callback;
-use raftstore::store::store::Store;
-use raftstore::store::util::{self, LeaseState, RemoteLease};
-use raftstore::store::{
-    cmd_resp, Msg as StoreMsg, Peer, ReadExecutor, ReadResponse, RequestInspector, RequestPolicy,
+use crate::raftstore::errors::RAFTSTORE_IS_BUSY;
+use crate::raftstore::store::fsm::{RaftPollerBuilder, RaftRouter};
+use crate::raftstore::store::util::{self, LeaseState, RemoteLease};
+use crate::raftstore::store::{
+    cmd_resp, Peer, ProposalRouter, RaftCommand, ReadExecutor, ReadResponse, RequestInspector,
+    RequestPolicy,
 };
-use raftstore::Result;
-use util::collections::HashMap;
-use util::time::duration_to_sec;
-use util::timer::Timer;
-use util::transport::{NotifyError, Sender};
-use util::worker::{Runnable, RunnableWithTimer};
+use crate::raftstore::Result;
+use engine::DB;
+use tikv_util::collections::HashMap;
+use tikv_util::time::duration_to_sec;
+use tikv_util::timer::Timer;
+use tikv_util::worker::{Runnable, RunnableWithTimer};
 
 use super::metrics::*;
 
@@ -103,16 +91,17 @@ impl ReadDelegate {
                 {
                     // Cache snapshot_time for remaining requests in the same batch.
                     *last_valid_ts = snapshot_time;
-                    if let Ok(mut resp) = executor.execute(req, &self.region) {
-                        // Leader can read local if and only if it is in lease.
-                        cmd_resp::bind_term(&mut resp.response, term);
-                        return Some(resp);
-                    }
+                    let mut resp = executor.execute(req, &self.region);
+                    // Leader can read local if and only if it is in lease.
+                    cmd_resp::bind_term(&mut resp.response, term);
+                    return Some(resp);
                 } else {
                     metrics.rejected_by_lease_expire += 1;
+                    debug!("rejected by lease expire"; "tag" => &self.tag);
                 }
             } else {
                 metrics.rejected_by_term_mismatch += 1;
+                debug!("rejected by term mismatch"; "tag" => &self.tag);
             }
         }
 
@@ -121,7 +110,7 @@ impl ReadDelegate {
 }
 
 impl Display for ReadDelegate {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "ReadDelegate for region {}, \
@@ -164,7 +153,7 @@ impl Progress {
 pub enum Task {
     Register(ReadDelegate),
     Update((u64, Progress)),
-    Read(StoreMsg),
+    Read(RaftCommand),
     Destroy(u64),
 }
 
@@ -182,103 +171,79 @@ impl Task {
         Task::Destroy(region_id)
     }
 
-    pub fn read(msg: StoreMsg) -> Task {
-        Task::Read(msg)
+    #[inline]
+    pub fn read(cmd: RaftCommand) -> Task {
+        Task::Read(cmd)
     }
 
-    /// Task accepts `Mag`s that contain Get/Snap requests and BatchRaftSnapCmds.
+    /// Task accepts `RaftCmdRequest`s that contain Get/Snap requests.
     /// Returns `true`, it can be saftly sent to localreader,
     /// Returns `false`, it must not be sent to localreader.
     #[inline]
-    pub fn acceptable(msg: &StoreMsg) -> bool {
-        match *msg {
-            StoreMsg::RaftCmd { ref request, .. } => {
-                if request.has_admin_request() || request.has_status_request() {
-                    false
-                } else {
-                    for r in request.get_requests() {
-                        match r.get_cmd_type() {
-                            CmdType::Get | CmdType::Snap => (),
-                            CmdType::Delete
-                            | CmdType::Put
-                            | CmdType::DeleteRange
-                            | CmdType::Prewrite
-                            | CmdType::IngestSST
-                            | CmdType::Invalid => return false,
-                        }
-                    }
-                    true
+    pub fn acceptable(request: &RaftCmdRequest) -> bool {
+        if request.has_admin_request() || request.has_status_request() {
+            false
+        } else {
+            for r in request.get_requests() {
+                match r.get_cmd_type() {
+                    CmdType::Get | CmdType::Snap => (),
+                    CmdType::Delete
+                    | CmdType::Put
+                    | CmdType::DeleteRange
+                    | CmdType::Prewrite
+                    | CmdType::IngestSST
+                    | CmdType::Invalid => return false,
                 }
             }
-            StoreMsg::BatchRaftSnapCmds { .. } => true,
-            _ => false,
+            true
         }
     }
 }
 
 impl Display for Task {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match *self {
             Task::Register(ref delegate) => write!(f, "localreader Task::Register {:?}", delegate),
-            Task::Read(ref msg) => write!(f, "localreader Task::Msg {:?}", msg),
+            Task::Read(ref cmd) => write!(f, "localreader Task::Read {:?}", cmd.request),
             Task::Update(ref progress) => write!(f, "localreader Task::Update {:?}", progress),
             Task::Destroy(region_id) => write!(f, "localreader Task::Destroy region {}", region_id),
         }
     }
 }
 
-fn handle_busy(cmd: StoreMsg) {
-    let mut err = errorpb::Error::new();
-    err.set_message(RAFTSTORE_IS_BUSY.to_owned());
-    let mut server_is_busy = errorpb::ServerIsBusy::new();
-    server_is_busy.set_reason(RAFTSTORE_IS_BUSY.to_owned());
-    err.set_server_is_busy(server_is_busy);
-    let mut resp = RaftCmdResponse::new();
-    resp.mut_header().set_error(err);
-
-    let read_resp = ReadResponse {
-        response: resp,
-        snapshot: None,
-    };
-
-    match cmd {
-        StoreMsg::RaftCmd { callback, .. } => callback.invoke_read(read_resp),
-        StoreMsg::BatchRaftSnapCmds {
-            batch, on_finished, ..
-        } => on_finished.invoke_batch_read(vec![Some(read_resp); batch.len()]),
-        other => panic!("unexpected cmd {:?}", other),
-    }
-}
-
-pub struct LocalReader<C: Sender<StoreMsg>> {
+pub struct LocalReader<C: ProposalRouter> {
     store_id: u64,
     kv_engine: Arc<DB>,
     metrics: RefCell<ReadMetrics>,
     // region id -> ReadDelegate
     delegates: HashMap<u64, ReadDelegate>,
     // A channel to raftstore.
-    ch: C,
+    router: C,
     tag: String,
 }
 
-impl LocalReader<mio::Sender<StoreMsg>> {
-    pub fn new<T, P>(store: &Store<T, P>) -> Self {
+impl LocalReader<RaftRouter> {
+    pub fn new<'a, T, P>(
+        builder: &RaftPollerBuilder<T, P>,
+        peers: impl Iterator<Item = &'a Peer>,
+    ) -> Self {
         let mut delegates =
-            HashMap::with_capacity_and_hasher(store.get_peers().len(), Default::default());
-        for (&region_id, p) in store.get_peers() {
+            HashMap::with_capacity_and_hasher(peers.size_hint().0, Default::default());
+        for p in peers {
             let delegate = ReadDelegate::from_peer(p);
-            debug!(
-                "{} init ReadDelegate for peer {:?}",
-                delegate.tag, delegate.peer_id
+            info!(
+                "create ReadDelegate";
+                "tag" => &delegate.tag,
+                "peer" => delegate.peer_id,
             );
-            delegates.insert(region_id, delegate);
+            delegates.insert(p.region().get_id(), delegate);
         }
-        let store_id = store.store_id();
+        let store_id = builder.store.get_id();
         LocalReader {
             delegates,
             store_id,
-            kv_engine: store.kv_engine(),
-            ch: store.get_sendch().into_inner(),
+            kv_engine: builder.engines.kv.clone(),
+            router: builder.router.clone(),
             metrics: Default::default(),
             tag: format!("[store {}]", store_id),
         }
@@ -291,19 +256,36 @@ impl LocalReader<mio::Sender<StoreMsg>> {
     }
 }
 
-impl<C: Sender<StoreMsg>> LocalReader<C> {
-    fn redirect(&self, cmd: StoreMsg) {
-        debug!("{} localreader redirect {:?}", self.tag, cmd);
-        match self.ch.send(cmd) {
-            Ok(()) => (),
-            Err(NotifyError::Full(cmd)) => {
+impl<C: ProposalRouter> LocalReader<C> {
+    fn redirect(&self, mut cmd: RaftCommand) {
+        debug!("localreader redirects command"; "tag" => &self.tag, "command" => ?cmd);
+        let region_id = cmd.request.get_header().get_region_id();
+        let mut err = errorpb::Error::new();
+        match self.router.send(cmd) {
+            Ok(()) => return,
+            Err(TrySendError::Full(c)) => {
                 self.metrics.borrow_mut().rejected_by_channel_full += 1;
-                handle_busy(cmd)
+                err.set_message(RAFTSTORE_IS_BUSY.to_owned());
+                err.mut_server_is_busy()
+                    .set_reason(RAFTSTORE_IS_BUSY.to_owned());
+                cmd = c;
             }
-            Err(err) => {
-                panic!("localreader redirect failed: {:?}", err);
+            Err(TrySendError::Disconnected(c)) => {
+                self.metrics.borrow_mut().rejected_by_no_region += 1;
+                err.set_message(format!("region {} is missing", region_id));
+                err.mut_region_not_found().set_region_id(region_id);
+                cmd = c;
             }
         }
+
+        let mut resp = RaftCmdResponse::new();
+        resp.mut_header().set_error(err);
+        let read_resp = ReadResponse {
+            response: resp,
+            snapshot: None,
+        };
+
+        cmd.callback.invoke_read(read_resp);
     }
 
     fn pre_propose_raft_command<'a>(
@@ -313,19 +295,23 @@ impl<C: Sender<StoreMsg>> LocalReader<C> {
         // Check store id.
         if let Err(e) = util::check_store_id(req, self.store_id) {
             self.metrics.borrow_mut().rejected_by_store_id_mismatch += 1;
+            debug!("rejected by store id not match"; "err" => %e);
             return Err(e);
         }
 
         // Check region id.
         let region_id = req.get_header().get_region_id();
         let delegate = match self.delegates.get(&region_id) {
-            Some(delegate) => delegate,
+            Some(delegate) => {
+                fail_point!("localreader_on_find_delegate");
+                delegate
+            }
             None => {
                 self.metrics.borrow_mut().rejected_by_no_region += 1;
+                debug!("rejected by no region"; "region_id" => region_id);
                 return Ok(None);
             }
         };
-
         // Check peer id.
         if let Err(e) = util::check_peer_id(req, delegate.peer_id) {
             self.metrics.borrow_mut().rejected_by_peer_id_mismatch += 1;
@@ -335,9 +321,9 @@ impl<C: Sender<StoreMsg>> LocalReader<C> {
         // Check term.
         if let Err(e) = util::check_term(req, delegate.term) {
             debug!(
-                "delegate.term {}, header.term {}",
-                delegate.term,
-                req.get_header().get_term()
+                "check term";
+                "delegate_term" => delegate.term,
+                "header_term" => req.get_header().get_term(),
             );
             self.metrics.borrow_mut().rejected_by_term_mismatch += 1;
             return Err(e);
@@ -347,6 +333,7 @@ impl<C: Sender<StoreMsg>> LocalReader<C> {
         if util::check_region_epoch(req, &delegate.region, false).is_err() {
             self.metrics.borrow_mut().rejected_by_epoch += 1;
             // Stale epoch, redirect it to raftstore to get the latest region.
+            debug!("rejected by epoch not match"; "tag" => &delegate.tag);
             return Ok(None);
         }
 
@@ -363,19 +350,13 @@ impl<C: Sender<StoreMsg>> LocalReader<C> {
     }
 
     // It can only handle read command.
-    fn propose_raft_command(
-        &mut self,
-        request: RaftCmdRequest,
-        callback: Callback,
-        send_time: Instant,
-        executor: &mut ReadExecutor,
-    ) {
-        let region_id = request.get_header().get_region_id();
-        match self.pre_propose_raft_command(&request) {
+    fn propose_raft_command(&mut self, cmd: RaftCommand, executor: &mut ReadExecutor) {
+        let region_id = cmd.request.get_header().get_region_id();
+        match self.pre_propose_raft_command(&cmd.request) {
             Ok(Some(delegate)) => {
                 let mut metrics = self.metrics.borrow_mut();
-                if let Some(resp) = delegate.handle_read(&request, executor, &mut *metrics) {
-                    callback.invoke_read(resp);
+                if let Some(resp) = delegate.handle_read(&cmd.request, executor, &mut *metrics) {
+                    cmd.callback.invoke_read(resp);
                     return;
                 }
             }
@@ -386,7 +367,7 @@ impl<C: Sender<StoreMsg>> LocalReader<C> {
                 if let Some(delegate) = self.delegates.get(&region_id) {
                     cmd_resp::bind_term(&mut response, delegate.term);
                 }
-                callback.invoke_read(ReadResponse {
+                cmd.callback.invoke_read(ReadResponse {
                     response,
                     snapshot: None,
                 });
@@ -394,49 +375,7 @@ impl<C: Sender<StoreMsg>> LocalReader<C> {
             }
         }
 
-        self.redirect(StoreMsg::RaftCmd {
-            send_time,
-            request,
-            callback,
-        });
-    }
-
-    fn propose_batch_raft_snapshot_command(
-        &mut self,
-        batch: Vec<RaftCmdRequest>,
-        on_finished: Callback,
-        executor: &mut ReadExecutor,
-    ) {
-        let size = batch.len();
-        let mut ret = Vec::with_capacity(size);
-        for req in batch {
-            let region_id = req.get_header().get_region_id();
-            match self.pre_propose_raft_command(&req) {
-                Ok(Some(delegate)) => {
-                    let mut metrics = self.metrics.borrow_mut();
-                    let resp = delegate.handle_read(&req, executor, &mut *metrics);
-                    ret.push(resp);
-                }
-                // It can not handle the rquest, instead of forwarding to raftstore,
-                // it returns a `None` which means users need to retry the requsets
-                // via `async_snapshot`.
-                Ok(None) => {
-                    ret.push(None);
-                }
-                Err(e) => {
-                    let mut response = cmd_resp::new_error(e);
-                    if let Some(delegate) = self.delegates.get(&region_id) {
-                        cmd_resp::bind_term(&mut response, delegate.term);
-                    }
-                    ret.push(Some(ReadResponse {
-                        response,
-                        snapshot: None,
-                    }));
-                }
-            }
-        }
-
-        on_finished.invoke_batch_read(ret);
+        self.redirect(cmd);
     }
 }
 
@@ -451,8 +390,10 @@ impl<'r, 'm> RequestInspector for Inspector<'r, 'm> {
             true
         } else {
             debug!(
-                "{} deny, applied_index_term {} != term {} ",
-                self.delegate.tag, self.delegate.applied_index_term, self.delegate.term
+                "rejected by term check";
+                "tag" => &self.delegate.tag,
+                "applied_index_term" => self.delegate.applied_index_term,
+                "delegate_term" => ?self.delegate.term,
             );
             self.metrics.rejected_by_appiled_term += 1;
             false
@@ -465,18 +406,14 @@ impl<'r, 'm> RequestInspector for Inspector<'r, 'm> {
             // We skip lease check, because it is postponed until `handle_read`.
             LeaseState::Valid
         } else {
-            debug!("{} leader lease is None", self.delegate.tag,);
+            debug!("rejected by leader lease"; "tag" => &self.delegate.tag);
             self.metrics.rejected_by_no_lease += 1;
             LeaseState::Expired
         }
     }
 }
 
-impl<C: Sender<StoreMsg>> Runnable<Task> for LocalReader<C> {
-    fn run(&mut self, _: Task) {
-        unreachable!()
-    }
-
+impl<C: ProposalRouter> Runnable<Task> for LocalReader<C> {
     fn run_batch(&mut self, tasks: &mut Vec<Task>) {
         self.metrics
             .borrow()
@@ -493,47 +430,30 @@ impl<C: Sender<StoreMsg>> Runnable<Task> for LocalReader<C> {
         for task in tasks.drain(..) {
             match task {
                 Task::Register(delegate) => {
-                    debug!(
-                        "{} register ReadDelegate for {:?}",
-                        delegate.tag, delegate.peer_id
-                    );
+                    info!("register ReadDelegate"; "tag" => &delegate.tag);
                     self.delegates.insert(delegate.region.get_id(), delegate);
                 }
-                Task::Read(StoreMsg::RaftCmd {
-                    send_time,
-                    request,
-                    callback,
-                }) => {
-                    self.propose_raft_command(request, callback, send_time, &mut executor);
+                Task::Read(cmd) => {
                     if sent.is_none() {
-                        sent = Some(send_time);
+                        sent = Some(cmd.send_time);
                     }
-                }
-                Task::Read(StoreMsg::BatchRaftSnapCmds {
-                    send_time,
-                    batch,
-                    on_finished,
-                }) => {
-                    self.propose_batch_raft_snapshot_command(batch, on_finished, &mut executor);
-                    if sent.is_none() {
-                        sent = Some(send_time);
-                    }
-                }
-                Task::Read(other) => {
-                    unimplemented!("unsupported Msg {:?}", other);
+                    self.propose_raft_command(cmd, &mut executor);
                 }
                 Task::Update((region_id, progress)) => {
                     if let Some(delegate) = self.delegates.get_mut(&region_id) {
                         delegate.update(progress);
                     } else {
-                        panic!(
-                            "unregistered ReadDelegate, region_id: {}, {:?}",
-                            region_id, progress
+                        warn!(
+                            "update unregistered ReadDelegate";
+                            "region_id" => region_id,
+                            "progress" => ?progress,
                         );
                     }
                 }
                 Task::Destroy(region_id) => {
-                    self.delegates.remove(&region_id);
+                    if let Some(delegate) = self.delegates.remove(&region_id) {
+                        info!("destroy ReadDelegate"; "tag" => &delegate.tag);
+                    }
                 }
             }
         }
@@ -547,12 +467,12 @@ impl<C: Sender<StoreMsg>> Runnable<Task> for LocalReader<C> {
     }
 }
 
-const METRICS_FLUSH_INTERVAL: u64 = 15; // 15s
+const METRICS_FLUSH_INTERVAL: u64 = 15_000; // 15s
 
-impl<C: Sender<StoreMsg>> RunnableWithTimer<Task, ()> for LocalReader<C> {
+impl<C: ProposalRouter> RunnableWithTimer<Task, ()> for LocalReader<C> {
     fn on_timeout(&mut self, timer: &mut Timer<()>, _: ()) {
         self.metrics.borrow_mut().flush();
-        timer.add_task(Duration::from_secs(METRICS_FLUSH_INTERVAL), ());
+        timer.add_task(Duration::from_millis(METRICS_FLUSH_INTERVAL), ());
     }
 }
 
@@ -660,11 +580,11 @@ mod tests {
     use tempdir::TempDir;
     use time::Duration;
 
-    use raftstore::store::util::Lease;
-    use raftstore::store::Callback;
-    use storage::ALL_CFS;
-    use util::rocksdb;
-    use util::time::monotonic_raw_now;
+    use crate::raftstore::store::util::Lease;
+    use crate::raftstore::store::Callback;
+    use engine::rocks;
+    use engine::ALL_CFS;
+    use tikv_util::time::monotonic_raw_now;
 
     use super::*;
 
@@ -673,15 +593,16 @@ mod tests {
         store_id: u64,
     ) -> (
         TempDir,
-        LocalReader<SyncSender<StoreMsg>>,
-        Receiver<StoreMsg>,
+        LocalReader<SyncSender<RaftCommand>>,
+        Receiver<RaftCommand>,
     ) {
         let path = TempDir::new(path).unwrap();
-        let db = rocksdb::new_engine(path.path().to_str().unwrap(), ALL_CFS, None).unwrap();
+        let db =
+            rocks::util::new_engine(path.path().to_str().unwrap(), None, ALL_CFS, None).unwrap();
         let (ch, rx) = sync_channel(1);
         let reader = LocalReader {
             store_id,
-            ch,
+            router: ch,
             kv_engine: Arc::new(db),
             delegates: HashMap::default(),
             metrics: Default::default(),
@@ -702,20 +623,12 @@ mod tests {
             .collect()
     }
 
-    fn must_extract_cmds(msg: StoreMsg) -> Vec<RaftCmdRequest> {
-        match msg {
-            StoreMsg::RaftCmd { request, .. } => vec![request],
-            StoreMsg::BatchRaftSnapCmds { batch, .. } => batch,
-            other => panic!("unexpected msg: {:?}", other),
-        }
-    }
-
     fn must_redirect(
-        reader: &mut LocalReader<SyncSender<StoreMsg>>,
-        rx: &Receiver<StoreMsg>,
+        reader: &mut LocalReader<SyncSender<RaftCommand>>,
+        rx: &Receiver<RaftCommand>,
         cmd: RaftCmdRequest,
     ) {
-        let task = Task::read(StoreMsg::new_raft_cmd(
+        let task = Task::read(RaftCommand::new(
             cmd.clone(),
             Callback::Read(Box::new(|resp| {
                 panic!("unexpected invoke, {:?}", resp);
@@ -723,11 +636,10 @@ mod tests {
         ));
         reader.run_batch(&mut vec![task]);
         assert_eq!(
-            must_extract_cmds(
-                rx.recv_timeout(Duration::seconds(5).to_std().unwrap())
-                    .unwrap()
-            ),
-            vec![cmd]
+            rx.recv_timeout(Duration::seconds(5).to_std().unwrap())
+                .unwrap()
+                .request,
+            cmd
         );
     }
 
@@ -801,7 +713,7 @@ mod tests {
 
         // Let's read.
         let region = region1.clone();
-        let task = Task::read(StoreMsg::new_raft_cmd(
+        let task = Task::read(RaftCommand::new(
             cmd.clone(),
             Callback::Read(Box::new(move |resp: ReadResponse| {
                 let snap = resp.snapshot.unwrap();
@@ -818,26 +730,13 @@ mod tests {
         // Renew lease.
         lease.renew(monotonic_raw_now());
 
-        // Batch snapshot.
-        let region = region1.clone();
-        let batch_task = Task::read(StoreMsg::new_batch_raft_snapshot_cmd(
-            vec![cmd.clone()],
-            Box::new(move |mut resps: Vec<Option<ReadResponse>>| {
-                assert_eq!(resps.len(), 1);
-                let snap = resps.remove(0).unwrap().snapshot.unwrap();
-                assert_eq!(snap.get_region(), &region);
-            }),
-        ));
-        reader.run_batch(&mut vec![batch_task]);
-        assert_eq!(rx.try_recv().unwrap_err(), TryRecvError::Empty);
-
         // Store id mismatch.
         let mut cmd_store_id = cmd.clone();
         cmd_store_id
             .mut_header()
             .mut_peer()
             .set_store_id(store_id + 1);
-        let task = Task::read(StoreMsg::new_raft_cmd(
+        let task = Task::read(RaftCommand::new(
             cmd_store_id,
             Callback::Read(Box::new(move |resp: ReadResponse| {
                 let err = resp.response.get_header().get_error();
@@ -854,7 +753,7 @@ mod tests {
             .mut_header()
             .mut_peer()
             .set_id(leader2.get_id() + 1);
-        let task = Task::read(StoreMsg::new_raft_cmd(
+        let task = Task::read(RaftCommand::new(
             cmd_peer_id,
             Callback::Read(Box::new(move |resp: ReadResponse| {
                 assert!(
@@ -876,7 +775,7 @@ mod tests {
         // Term mismatch.
         let mut cmd_term = cmd.clone();
         cmd_term.mut_header().set_term(term6 - 2);
-        let task = Task::read(StoreMsg::new_raft_cmd(
+        let task = Task::read(RaftCommand::new(
             cmd_term,
             Callback::Read(Box::new(move |resp: ReadResponse| {
                 let err = resp.response.get_header().get_error();
@@ -906,8 +805,8 @@ mod tests {
         );
 
         // Channel full.
-        let task1 = Task::read(StoreMsg::new_raft_cmd(cmd.clone(), Callback::None));
-        let task_full = Task::read(StoreMsg::new_raft_cmd(
+        let task1 = Task::read(RaftCommand::new(cmd.clone(), Callback::None));
+        let task_full = Task::read(RaftCommand::new(
             cmd.clone(),
             Callback::Read(Box::new(move |resp: ReadResponse| {
                 let err = resp.response.get_header().get_error();
@@ -925,7 +824,7 @@ mod tests {
         let previous_term_rejection = reader.metrics.borrow().rejected_by_term_mismatch;
         let mut cmd9 = cmd.clone();
         cmd9.mut_header().set_term(term6 + 3);
-        let msg = StoreMsg::new_raft_cmd(
+        let msg = RaftCommand::new(
             cmd9.clone(),
             Callback::Read(Box::new(|resp| {
                 panic!("unexpected invoke, {:?}", resp);
@@ -938,11 +837,10 @@ mod tests {
         ];
         reader.run_batch(&mut batch);
         assert_eq!(
-            must_extract_cmds(
-                rx.recv_timeout(Duration::seconds(5).to_std().unwrap())
-                    .unwrap()
-            ),
-            vec![cmd9]
+            rx.recv_timeout(Duration::seconds(5).to_std().unwrap())
+                .unwrap()
+                .request,
+            cmd9
         );
         assert_eq!(
             reader.metrics.borrow().rejected_by_term_mismatch,

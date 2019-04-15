@@ -1,25 +1,12 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-// FIXME(shirly): remove following later
-#![allow(dead_code)]
 use super::column::{Column, ColumnEncoder};
 use super::Result;
-use coprocessor::codec::Datum;
+use crate::coprocessor::codec::Datum;
 use std::io::Write;
-use tipb::expression::FieldType;
 #[cfg(test)]
-use util::codec::BytesSlice;
+use tikv_util::codec::BytesSlice;
+use tipb::expression::FieldType;
 
 /// `Chunk` stores multiple rows of data in Apache Arrow format.
 /// See https://arrow.apache.org/docs/memory_layout.html
@@ -71,7 +58,7 @@ impl Chunk {
 
     /// Get the Row in the chunk with the row index.
     #[inline]
-    pub fn get_row(&self, idx: usize) -> Option<Row> {
+    pub fn get_row(&self, idx: usize) -> Option<Row<'_>> {
         if idx < self.num_rows() {
             Some(Row::new(self, idx))
         } else {
@@ -81,12 +68,12 @@ impl Chunk {
 
     // Get the Iterator for Row in the Chunk.
     #[inline]
-    pub fn iter(&self) -> RowIterator {
+    pub fn iter(&self) -> RowIterator<'_> {
         RowIterator::new(self)
     }
 
     #[cfg(test)]
-    pub fn decode(buf: &mut BytesSlice, tps: &[FieldType]) -> Result<Chunk> {
+    pub fn decode(buf: &mut BytesSlice<'_>, tps: &[FieldType]) -> Result<Chunk> {
         let mut chunk = Chunk {
             columns: Vec::with_capacity(tps.len()),
         };
@@ -166,28 +153,24 @@ impl<'a> Iterator for RowIterator<'a> {
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-    use coprocessor::codec::datum::Datum;
-    use coprocessor::codec::mysql::*;
-    use tipb::expression::FieldType;
+mod tests {
+    use cop_datatype::FieldTypeTp;
 
-    pub fn field_type(tp: u8) -> FieldType {
-        let mut fp = FieldType::new();
-        fp.set_tp(i32::from(tp));
-        fp
-    }
+    use super::*;
+    use crate::coprocessor::codec::chunk::tests::*;
+    use crate::coprocessor::codec::datum::Datum;
+    use crate::coprocessor::codec::mysql::*;
 
     #[test]
     fn test_append_datum() {
         let fields = vec![
-            field_type(types::LONG_LONG),
-            field_type(types::FLOAT),
-            field_type(types::DATETIME),
-            field_type(types::DURATION),
-            field_type(types::NEW_DECIMAL),
-            field_type(types::JSON),
-            field_type(types::STRING),
+            field_type(FieldTypeTp::LongLong),
+            field_type(FieldTypeTp::Float),
+            field_type(FieldTypeTp::DateTime),
+            field_type(FieldTypeTp::Duration),
+            field_type(FieldTypeTp::NewDecimal),
+            field_type(FieldTypeTp::JSON),
+            field_type(FieldTypeTp::String),
         ];
         let json: Json = r#"{"k1":"v1"}"#.parse().unwrap();
         let time: Time = Time::parse_utc_datetime("2012-12-31 11:30:45", -1).unwrap();
@@ -222,12 +205,12 @@ mod test {
     fn test_codec() {
         let rows = 10;
         let fields = vec![
-            field_type(types::LONG_LONG),
-            field_type(types::LONG_LONG),
-            field_type(types::VARCHAR),
-            field_type(types::VARCHAR),
-            field_type(types::NEW_DECIMAL),
-            field_type(types::JSON),
+            field_type(FieldTypeTp::LongLong),
+            field_type(FieldTypeTp::LongLong),
+            field_type(FieldTypeTp::VarChar),
+            field_type(FieldTypeTp::VarChar),
+            field_type(FieldTypeTp::NewDecimal),
+            field_type(FieldTypeTp::JSON),
         ];
         let mut chunk = Chunk::new(&fields, rows);
 

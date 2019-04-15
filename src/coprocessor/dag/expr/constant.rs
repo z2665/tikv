@@ -1,21 +1,10 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::borrow::Cow;
 
 use super::{Constant, Result};
-use coprocessor::codec::mysql::{Decimal, Duration, Json, Time};
-use coprocessor::codec::Datum;
+use crate::coprocessor::codec::mysql::{Decimal, Duration, Json, Time};
+use crate::coprocessor::codec::Datum;
 
 impl Datum {
     #[inline]
@@ -38,7 +27,7 @@ impl Datum {
     }
 
     #[inline]
-    pub fn as_decimal(&self) -> Result<Option<Cow<Decimal>>> {
+    pub fn as_decimal(&self) -> Result<Option<Cow<'_, Decimal>>> {
         match *self {
             Datum::Null => Ok(None),
             Datum::Dec(ref d) => Ok(Some(Cow::Borrowed(d))),
@@ -47,7 +36,7 @@ impl Datum {
     }
 
     #[inline]
-    pub fn as_string(&self) -> Result<Option<Cow<[u8]>>> {
+    pub fn as_string(&self) -> Result<Option<Cow<'_, [u8]>>> {
         match *self {
             Datum::Null => Ok(None),
             Datum::Bytes(ref b) => Ok(Some(Cow::Borrowed(b))),
@@ -56,7 +45,7 @@ impl Datum {
     }
 
     #[inline]
-    pub fn as_time(&self) -> Result<Option<Cow<Time>>> {
+    pub fn as_time(&self) -> Result<Option<Cow<'_, Time>>> {
         match *self {
             Datum::Null => Ok(None),
             Datum::Time(ref t) => Ok(Some(Cow::Borrowed(t))),
@@ -65,7 +54,7 @@ impl Datum {
     }
 
     #[inline]
-    pub fn as_duration(&self) -> Result<Option<Cow<Duration>>> {
+    pub fn as_duration(&self) -> Result<Option<Cow<'_, Duration>>> {
         match *self {
             Datum::Null => Ok(None),
             Datum::Dur(ref d) => Ok(Some(Cow::Borrowed(d))),
@@ -74,7 +63,7 @@ impl Datum {
     }
 
     #[inline]
-    pub fn as_json(&self) -> Result<Option<Cow<Json>>> {
+    pub fn as_json(&self) -> Result<Option<Cow<'_, Json>>> {
         match *self {
             Datum::Null => Ok(None),
             Datum::Json(ref j) => Ok(Some(Cow::Borrowed(j))),
@@ -99,37 +88,37 @@ impl Constant {
     }
 
     #[inline]
-    pub fn eval_decimal(&self) -> Result<Option<Cow<Decimal>>> {
+    pub fn eval_decimal(&self) -> Result<Option<Cow<'_, Decimal>>> {
         self.val.as_decimal()
     }
 
     #[inline]
-    pub fn eval_string(&self) -> Result<Option<Cow<[u8]>>> {
+    pub fn eval_string(&self) -> Result<Option<Cow<'_, [u8]>>> {
         self.val.as_string()
     }
 
     #[inline]
-    pub fn eval_time(&self) -> Result<Option<Cow<Time>>> {
+    pub fn eval_time(&self) -> Result<Option<Cow<'_, Time>>> {
         self.val.as_time()
     }
 
     #[inline]
-    pub fn eval_duration(&self) -> Result<Option<Cow<Duration>>> {
+    pub fn eval_duration(&self) -> Result<Option<Cow<'_, Duration>>> {
         self.val.as_duration()
     }
 
     #[inline]
-    pub fn eval_json(&self) -> Result<Option<Cow<Json>>> {
+    pub fn eval_json(&self) -> Result<Option<Cow<'_, Json>>> {
         self.val.as_json()
     }
 }
 
 #[cfg(test)]
-mod test {
-    use coprocessor::codec::mysql::{Decimal, Duration, Json, Time};
-    use coprocessor::codec::Datum;
-    use coprocessor::dag::expr::test::datum_expr;
-    use coprocessor::dag::expr::{EvalContext, Expression};
+mod tests {
+    use crate::coprocessor::codec::mysql::{Decimal, Duration, Json, Time};
+    use crate::coprocessor::codec::Datum;
+    use crate::coprocessor::dag::expr::tests::datum_expr;
+    use crate::coprocessor::dag::expr::{EvalContext, Expression};
     use std::u64;
 
     #[derive(PartialEq, Debug)]
@@ -156,7 +145,7 @@ mod test {
             datum_expr(Datum::F64(124.32)),
             datum_expr(Datum::Dec(dec.clone())),
             datum_expr(Datum::Bytes(s.clone())),
-            datum_expr(Datum::Dur(dur.clone())),
+            datum_expr(Datum::Dur(dur)),
         ];
 
         let expecteds = vec![
@@ -166,12 +155,12 @@ mod test {
             EvalResults(None, Some(124.32), None, None, None, None, None),
             EvalResults(None, None, Some(dec.clone()), None, None, None, None),
             EvalResults(None, None, None, Some(s.clone()), None, None, None),
-            EvalResults(None, None, None, None, None, Some(dur.clone()), None),
+            EvalResults(None, None, None, None, None, Some(dur), None),
         ];
 
         let mut ctx = EvalContext::default();
         for (case, expected) in tests.into_iter().zip(expecteds.into_iter()) {
-            let e = Expression::build(&mut ctx, case).unwrap();
+            let e = Expression::build(&ctx, case).unwrap();
 
             let i = e.eval_int(&mut ctx, &[]).unwrap_or(None);
             let r = e.eval_real(&mut ctx, &[]).unwrap_or(None);

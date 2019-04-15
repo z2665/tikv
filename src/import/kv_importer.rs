@@ -1,15 +1,4 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::fmt;
 use std::fs;
@@ -19,13 +8,14 @@ use std::sync::{Arc, Mutex};
 use kvproto::import_kvpb::*;
 use uuid::Uuid;
 
-use config::DbConfig;
-use util::collections::HashMap;
+use crate::config::DbConfig;
+use tikv_util::collections::HashMap;
 
 use super::client::*;
 use super::engine::*;
 use super::import::*;
 use super::{Config, Error, Result};
+use tikv_util::security::SecurityConfig;
 
 pub struct Inner {
     engines: HashMap<Uuid, Arc<EngineFile>>,
@@ -40,8 +30,8 @@ pub struct KVImporter {
 }
 
 impl KVImporter {
-    pub fn new(cfg: Config, opts: DbConfig) -> Result<KVImporter> {
-        let dir = EngineDir::new(&cfg.import_dir, opts)?;
+    pub fn new(cfg: Config, db_cfg: DbConfig, security_cfg: SecurityConfig) -> Result<KVImporter> {
+        let dir = EngineDir::new(&cfg.import_dir, db_cfg, security_cfg)?;
         Ok(KVImporter {
             cfg,
             dir,
@@ -54,19 +44,28 @@ impl KVImporter {
 
     /// Open the engine.
     pub fn open_engine(&self, uuid: Uuid) -> Result<()> {
+        // Checks if we have already opened an engine related to UUID
         let mut inner = self.inner.lock().unwrap();
         if inner.engines.contains_key(&uuid) {
             return Ok(());
         }
 
+        // Restrict max open engines
+        if inner.engines.len() >= self.cfg.max_open_engines {
+            error!("Too many open engines "; "uuid" => %uuid, "opened_engine_count" => %inner.engines.len());
+            return Err(Error::ResourceTemporarilyUnavailable(
+                "Too many open engines".to_string(),
+            ));
+        }
+
         match self.dir.open(uuid) {
             Ok(engine) => {
-                info!("open {:?}", engine);
+                info!("open engine"; "engine" => ?engine);
                 inner.engines.insert(uuid, Arc::new(engine));
                 Ok(())
             }
             Err(e) => {
-                error!("open {}: {:?}", uuid, e);
+                error!("open engine failed"; "uuid" => %uuid, "err" => %e);
                 Err(e)
             }
         }
@@ -101,11 +100,11 @@ impl KVImporter {
 
         match engine.close() {
             Ok(_) => {
-                info!("close {:?}", engine);
+                info!("close engine"; "engine" => ?engine);
                 Ok(())
             }
             Err(e) => {
-                error!("close {:?}: {:?}", engine, e);
+                error!("close engine failed"; "engine" => ?engine, "err" => %e);
                 Err(e)
             }
         }
@@ -117,6 +116,7 @@ impl KVImporter {
         let client = Client::new(pd_addr, self.cfg.num_import_jobs)?;
         let job = {
             let mut inner = self.inner.lock().unwrap();
+            // One engine only related to one ImportJob
             if inner.engines.contains_key(&uuid) || inner.import_jobs.contains_key(&uuid) {
                 return Err(Error::EngineInUse(uuid));
             }
@@ -131,11 +131,11 @@ impl KVImporter {
 
         match res {
             Ok(_) => {
-                info!("import {}", uuid);
+                info!("import"; "uuid" => %uuid);
                 Ok(())
             }
             Err(e) => {
-                error!("import {}: {:?}", uuid, e);
+                error!("import failed"; "uuid" => %uuid, "err" => %e);
                 Err(e)
             }
         }
@@ -165,11 +165,11 @@ impl KVImporter {
 
         match self.dir.cleanup(uuid) {
             Ok(_) => {
-                info!("cleanup {}", uuid);
+                info!("cleanup"; "uuid" => %uuid);
                 Ok(())
             }
             Err(e) => {
-                error!("cleanup {}: {:?}", uuid, e);
+                error!("cleanup failed"; "uuid" => %uuid, "err" => %e);
                 Err(e)
             }
         }
@@ -181,7 +181,8 @@ impl KVImporter {
 /// The temporary RocksDB engine is placed in `$root/.temp/$uuid`. After writing
 /// is completed, the files are stored in `$root/$uuid`.
 pub struct EngineDir {
-    opts: DbConfig,
+    db_cfg: DbConfig,
+    security_cfg: SecurityConfig,
     root_dir: PathBuf,
     temp_dir: PathBuf,
 }
@@ -189,7 +190,11 @@ pub struct EngineDir {
 impl EngineDir {
     const TEMP_DIR: &'static str = ".temp";
 
-    fn new<P: AsRef<Path>>(root: P, opts: DbConfig) -> Result<EngineDir> {
+    fn new<P: AsRef<Path>>(
+        root: P,
+        db_cfg: DbConfig,
+        security_cfg: SecurityConfig,
+    ) -> Result<EngineDir> {
         let root_dir = root.as_ref().to_owned();
         let temp_dir = root_dir.join(Self::TEMP_DIR);
         if temp_dir.exists() {
@@ -197,7 +202,8 @@ impl EngineDir {
         }
         fs::create_dir_all(&temp_dir)?;
         Ok(EngineDir {
-            opts,
+            db_cfg,
+            security_cfg,
             root_dir,
             temp_dir,
         })
@@ -213,19 +219,27 @@ impl EngineDir {
         }
     }
 
+    /// Creates an engine from `$root/.temp/$uuid` for storing and sorting KV pairs temporarily.
     fn open(&self, uuid: Uuid) -> Result<EngineFile> {
         let path = self.join(uuid);
         if path.save.exists() {
             return Err(Error::FileExists(path.save));
         }
-        EngineFile::new(uuid, path, self.opts.clone())
+        EngineFile::new(uuid, path, self.db_cfg.clone(), self.security_cfg.clone())
     }
 
+    /// Creates an engine from `$root/$uuid` for importing data.
     fn import(&self, uuid: Uuid) -> Result<Engine> {
         let path = self.join(uuid);
-        Engine::new(&path.save, uuid, self.opts.clone())
+        Engine::new(
+            &path.save,
+            uuid,
+            self.db_cfg.clone(),
+            self.security_cfg.clone(),
+        )
     }
 
+    /// Cleans up directories for both `$root/.temp/$uuid` and `$root/$uuid`
     fn cleanup(&self, uuid: Uuid) -> Result<EnginePath> {
         let path = self.join(uuid);
         if path.save.exists() {
@@ -247,7 +261,7 @@ pub struct EnginePath {
 }
 
 impl fmt::Debug for EnginePath {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EnginePath")
             .field("save", &self.save)
             .field("temp", &self.temp)
@@ -264,8 +278,14 @@ pub struct EngineFile {
 }
 
 impl EngineFile {
-    fn new(uuid: Uuid, path: EnginePath, opts: DbConfig) -> Result<EngineFile> {
-        let engine = Engine::new(&path.temp, uuid, opts)?;
+    /// Creates an engine in the temp directory for writing.
+    fn new(
+        uuid: Uuid,
+        path: EnginePath,
+        db_cfg: DbConfig,
+        security_cfg: SecurityConfig,
+    ) -> Result<EngineFile> {
+        let engine = Engine::new(&path.temp, uuid, db_cfg, security_cfg)?;
         Ok(EngineFile {
             uuid,
             path,
@@ -273,6 +293,7 @@ impl EngineFile {
         })
     }
 
+    /// Writes KV pairs to the engine.
     pub fn write(&self, batch: WriteBatch) -> Result<usize> {
         self.engine.as_ref().unwrap().write(batch)
     }
@@ -300,13 +321,13 @@ impl EngineFile {
 impl Drop for EngineFile {
     fn drop(&mut self) {
         if let Err(e) = self.cleanup() {
-            warn!("cleanup {:?}: {:?}", self, e);
+            warn!("cleanup"; "engine file" => ?self, "err" => %e);
         }
     }
 }
 
 impl fmt::Debug for EngineFile {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EngineFile")
             .field("uuid", &self.uuid)
             .field("path", &self.path)
@@ -326,7 +347,8 @@ mod tests {
 
         let mut cfg = Config::default();
         cfg.import_dir = temp_dir.path().to_str().unwrap().to_owned();
-        let importer = KVImporter::new(cfg, DbConfig::default()).unwrap();
+        let importer =
+            KVImporter::new(cfg, DbConfig::default(), SecurityConfig::default()).unwrap();
 
         let uuid = Uuid::new_v4();
         // Can not bind to an unopened engine.
@@ -345,7 +367,8 @@ mod tests {
         let temp_dir = TempDir::new("test_engine_file").unwrap();
 
         let uuid = Uuid::new_v4();
-        let opts = DbConfig::default();
+        let db_cfg = DbConfig::default();
+        let security_cfg = SecurityConfig::default();
         let path = EnginePath {
             save: temp_dir.path().join("save"),
             temp: temp_dir.path().join("temp"),
@@ -353,9 +376,12 @@ mod tests {
 
         // Test close.
         {
-            let mut f = EngineFile::new(uuid, path.clone(), opts.clone()).unwrap();
+            let mut f =
+                EngineFile::new(uuid, path.clone(), db_cfg.clone(), security_cfg.clone()).unwrap();
             // Cannot create the same file again.
-            assert!(EngineFile::new(uuid, path.clone(), opts.clone()).is_err());
+            assert!(
+                EngineFile::new(uuid, path.clone(), db_cfg.clone(), security_cfg.clone()).is_err()
+            );
             assert!(path.temp.exists());
             assert!(!path.save.exists());
             f.close().unwrap();
@@ -366,7 +392,8 @@ mod tests {
 
         // Test cleanup.
         {
-            let f = EngineFile::new(uuid, path.clone(), opts.clone()).unwrap();
+            let f =
+                EngineFile::new(uuid, path.clone(), db_cfg.clone(), security_cfg.clone()).unwrap();
             assert!(path.temp.exists());
             assert!(!path.save.exists());
             drop(f);

@@ -1,15 +1,4 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::vec::IntoIter;
 
@@ -18,17 +7,18 @@ use kvproto::coprocessor::{KeyRange, Response};
 use protobuf::Message;
 use tipb::checksum::{ChecksumAlgorithm, ChecksumRequest, ChecksumResponse, ChecksumScanOn};
 
-use storage::{Snapshot, SnapshotStore};
+use crate::storage::{Snapshot, SnapshotStore};
 
-use coprocessor::dag::executor::{ExecutorMetrics, ScanOn, Scanner};
-use coprocessor::*;
+use crate::coprocessor::dag::executor::ExecutorMetrics;
+use crate::coprocessor::dag::{ScanOn, Scanner};
+use crate::coprocessor::*;
 
 // `ChecksumContext` is used to handle `ChecksumRequest`
 pub struct ChecksumContext<S: Snapshot> {
     req: ChecksumRequest,
     store: SnapshotStore<S>,
     ranges: IntoIter<KeyRange>,
-    scanner: Option<Scanner<S>>,
+    scanner: Option<Scanner<SnapshotStore<S>>>,
     metrics: ExecutorMetrics,
 }
 
@@ -79,7 +69,7 @@ impl<S: Snapshot> ChecksumContext<S> {
         }
     }
 
-    fn new_scanner(&self, range: KeyRange) -> Result<Scanner<S>> {
+    fn new_scanner(&self, range: KeyRange) -> Result<Scanner<SnapshotStore<S>>> {
         let scan_on = match self.req.get_scan_on() {
             ChecksumScanOn::Table => ScanOn::Table,
             ChecksumScanOn::Index => ScanOn::Index,

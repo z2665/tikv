@@ -1,17 +1,6 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use util::config::ReadableSize;
+use tikv_util::config::ReadableSize;
 
 // Assume a request can be finished in 1ms, a request at position x will wait about
 // 0.001 * x secs to be actual started. A server-is-busy error will trigger 2 seconds
@@ -21,6 +10,7 @@ pub const DEFAULT_MAX_TASKS_PER_WORKER: usize = 2 as usize * 1000;
 
 pub const DEFAULT_STACK_SIZE_MB: u64 = 10;
 
+/// Configuration for the `ReadPool`.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub high_concurrency: usize,
@@ -33,7 +23,10 @@ pub struct Config {
 }
 
 impl Config {
-    /// Only used in tests.
+    /// A shortcut to construct Config with the specified concurrency.
+    ///
+    /// Note: it is only used in tests.
+    #[doc(hidden)]
     pub fn default_with_concurrency(concurrency: usize) -> Self {
         Self {
             high_concurrency: concurrency,
@@ -46,7 +39,7 @@ impl Config {
         }
     }
 
-    /// Only used in tests.
+    #[doc(hidden)]
     pub fn default_for_test() -> Self {
         Self::default_with_concurrency(2)
     }

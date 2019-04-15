@@ -1,18 +1,4 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// FIXME: remove following later
-#![allow(dead_code)]
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::path_expr::{
     PathExpression, PathLeg, PATH_EXPR_ARRAY_INDEX_ASTERISK, PATH_EXPR_ASTERISK,
@@ -49,35 +35,45 @@ pub fn extract_json(j: &Json, path_legs: &[PathLeg]) -> Vec<Json> {
     let mut ret = vec![];
     match *current_leg {
         PathLeg::Index(i) => match *j {
-            Json::Array(ref array) => if i == PATH_EXPR_ARRAY_INDEX_ASTERISK {
-                for child in array {
-                    ret.append(&mut extract_json(child, sub_path_legs))
+            Json::Array(ref array) => {
+                if i == PATH_EXPR_ARRAY_INDEX_ASTERISK {
+                    for child in array {
+                        ret.append(&mut extract_json(child, sub_path_legs))
+                    }
+                } else if (i as usize) < array.len() {
+                    ret.append(&mut extract_json(&array[i as usize], sub_path_legs))
                 }
-            } else if (i as usize) < array.len() {
-                ret.append(&mut extract_json(&array[i as usize], sub_path_legs))
-            },
-            _ => if (i == PATH_EXPR_ARRAY_INDEX_ASTERISK) || (i as usize == 0) {
-                ret.append(&mut extract_json(j, sub_path_legs))
-            },
-        },
-        PathLeg::Key(ref key) => if let Json::Object(ref map) = *j {
-            if key == PATH_EXPR_ASTERISK {
-                for key in map.keys() {
-                    ret.append(&mut extract_json(&map[key], sub_path_legs))
+            }
+            _ => {
+                if (i == PATH_EXPR_ARRAY_INDEX_ASTERISK) || (i as usize == 0) {
+                    ret.append(&mut extract_json(j, sub_path_legs))
                 }
-            } else if map.contains_key(key) {
-                ret.append(&mut extract_json(&map[key], sub_path_legs))
             }
         },
+        PathLeg::Key(ref key) => {
+            if let Json::Object(ref map) = *j {
+                if key == PATH_EXPR_ASTERISK {
+                    for key in map.keys() {
+                        ret.append(&mut extract_json(&map[key], sub_path_legs))
+                    }
+                } else if map.contains_key(key) {
+                    ret.append(&mut extract_json(&map[key], sub_path_legs))
+                }
+            }
+        }
         PathLeg::DoubleAsterisk => {
             ret.append(&mut extract_json(j, sub_path_legs));
             match *j {
-                Json::Array(ref array) => for child in array {
-                    ret.append(&mut extract_json(child, path_legs))
-                },
-                Json::Object(ref map) => for key in map.keys() {
-                    ret.append(&mut extract_json(&map[key], path_legs))
-                },
+                Json::Array(ref array) => {
+                    for child in array {
+                        ret.append(&mut extract_json(child, path_legs))
+                    }
+                }
+                Json::Object(ref map) => {
+                    for key in map.keys() {
+                        ret.append(&mut extract_json(&map[key], path_legs))
+                    }
+                }
                 _ => {}
             }
         }
@@ -86,7 +82,7 @@ pub fn extract_json(j: &Json, path_legs: &[PathLeg]) -> Vec<Json> {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::super::path_expr::{
         PathExpressionFlag, PATH_EXPRESSION_CONTAINS_ASTERISK,
         PATH_EXPRESSION_CONTAINS_DOUBLE_ASTERISK, PATH_EXPR_ARRAY_INDEX_ASTERISK,

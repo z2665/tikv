@@ -1,30 +1,19 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::io::Error as IoError;
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::result;
 
+use crate::grpc::Error as GrpcError;
 use futures::sync::oneshot::Canceled;
-use grpc::Error as GrpcError;
 use kvproto::errorpb;
 use kvproto::metapb::*;
 use uuid::{ParseError, Uuid};
 
-use pd::{Error as PdError, RegionInfo};
-use raftstore::errors::Error as RaftStoreError;
-use util::codec::Error as CodecError;
+use crate::pd::{Error as PdError, RegionInfo};
+use crate::raftstore::errors::Error as RaftStoreError;
+use tikv_util::codec::Error as CodecError;
 
 quick_error! {
     #[derive(Debug)]
@@ -56,6 +45,11 @@ quick_error! {
         RocksDB(msg: String) {
             from()
             display("RocksDB {}", msg)
+        }
+        Engine(err: engine::Error) {
+            from()
+            description("Engine error")
+            display("Engine {:?}", err)
         }
         RaftStore(err: RaftStoreError) {
             from()
@@ -98,7 +92,7 @@ quick_error! {
             display("TikvRPC {:?}", err)
         }
         NotLeader(new_leader: Option<Peer>) {}
-        StaleEpoch(new_regions: Vec<Region>) {}
+        EpochNotMatch(current_regions: Vec<Region>) {}
         UpdateRegion(new_region: RegionInfo) {}
         ImportJobFailed(tag: String) {
             display("{}", tag)
@@ -108,6 +102,9 @@ quick_error! {
         }
         PrepareRangeJobFailed(tag: String) {
             display("{}", tag)
+        }
+        ResourceTemporarilyUnavailable(msg: String) {
+            display("{}", msg)
         }
     }
 }
@@ -121,9 +118,9 @@ impl From<errorpb::Error> for Error {
             } else {
                 Error::NotLeader(None)
             }
-        } else if err.has_stale_epoch() {
-            let mut error = err.take_stale_epoch();
-            Error::StaleEpoch(error.take_new_regions().to_vec())
+        } else if err.has_epoch_not_match() {
+            let mut error = err.take_epoch_not_match();
+            Error::EpochNotMatch(error.take_current_regions().to_vec())
         } else {
             Error::TikvRPC(err)
         }

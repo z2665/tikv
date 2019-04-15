@@ -1,17 +1,9 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use prometheus::local::LocalHistogram;
+use std::sync::{Arc, Mutex};
+
+use tikv_util::collections::HashSet;
 
 use super::metrics::*;
 
@@ -301,6 +293,70 @@ impl RaftProposeMetrics {
     }
 }
 
+/// The buffered metrics counter for invalid propose
+#[derive(Clone)]
+pub struct RaftInvalidProposeMetrics {
+    pub mismatch_store_id: u64,
+    pub region_not_found: u64,
+    pub not_leader: u64,
+    pub mismatch_peer_id: u64,
+    pub stale_command: u64,
+    pub epoch_not_match: u64,
+}
+
+impl Default for RaftInvalidProposeMetrics {
+    fn default() -> RaftInvalidProposeMetrics {
+        RaftInvalidProposeMetrics {
+            mismatch_store_id: 0,
+            region_not_found: 0,
+            not_leader: 0,
+            mismatch_peer_id: 0,
+            stale_command: 0,
+            epoch_not_match: 0,
+        }
+    }
+}
+
+impl RaftInvalidProposeMetrics {
+    fn flush(&mut self) {
+        if self.mismatch_store_id > 0 {
+            RAFT_INVALID_PROPOSAL_COUNTER_VEC
+                .with_label_values(&["mismatch_store_id"])
+                .inc_by(self.mismatch_store_id as i64);
+            self.mismatch_store_id = 0;
+        }
+        if self.region_not_found > 0 {
+            RAFT_INVALID_PROPOSAL_COUNTER_VEC
+                .with_label_values(&["region_not_found"])
+                .inc_by(self.region_not_found as i64);
+            self.region_not_found = 0;
+        }
+        if self.not_leader > 0 {
+            RAFT_INVALID_PROPOSAL_COUNTER_VEC
+                .with_label_values(&["not_leader"])
+                .inc_by(self.not_leader as i64);
+            self.not_leader = 0;
+        }
+        if self.mismatch_peer_id > 0 {
+            RAFT_INVALID_PROPOSAL_COUNTER_VEC
+                .with_label_values(&["mismatch_peer_id"])
+                .inc_by(self.mismatch_peer_id as i64);
+            self.mismatch_peer_id = 0;
+        }
+        if self.stale_command > 0 {
+            RAFT_INVALID_PROPOSAL_COUNTER_VEC
+                .with_label_values(&["stale_command"])
+                .inc_by(self.stale_command as i64);
+            self.stale_command = 0;
+        }
+        if self.epoch_not_match > 0 {
+            RAFT_INVALID_PROPOSAL_COUNTER_VEC
+                .with_label_values(&["epoch_not_match"])
+                .inc_by(self.epoch_not_match as i64);
+            self.epoch_not_match = 0;
+        }
+    }
+}
 /// The buffered metrics counters for raft.
 #[derive(Clone)]
 pub struct RaftMetrics {
@@ -308,10 +364,10 @@ pub struct RaftMetrics {
     pub message: RaftMessageMetrics,
     pub message_dropped: RaftMessageDropMetrics,
     pub propose: RaftProposeMetrics,
-    pub process_tick: LocalHistogram,
     pub process_ready: LocalHistogram,
     pub append_log: LocalHistogram,
-    pub leader_missing: usize,
+    pub leader_missing: Arc<Mutex<HashSet<u64>>>,
+    pub invalid_proposal: RaftInvalidProposeMetrics,
 }
 
 impl Default for RaftMetrics {
@@ -321,14 +377,12 @@ impl Default for RaftMetrics {
             message: Default::default(),
             message_dropped: Default::default(),
             propose: Default::default(),
-            process_tick: PEER_RAFT_PROCESS_DURATION
-                .with_label_values(&["tick"])
-                .local(),
             process_ready: PEER_RAFT_PROCESS_DURATION
                 .with_label_values(&["ready"])
                 .local(),
             append_log: PEER_APPEND_LOG_HISTOGRAM.local(),
-            leader_missing: 0,
+            leader_missing: Arc::default(),
+            invalid_proposal: Default::default(),
         }
     }
 }
@@ -339,10 +393,12 @@ impl RaftMetrics {
         self.ready.flush();
         self.message.flush();
         self.propose.flush();
-        self.process_tick.flush();
         self.process_ready.flush();
         self.append_log.flush();
         self.message_dropped.flush();
-        LEADER_MISSING.set(self.leader_missing as i64);
+        self.invalid_proposal.flush();
+        let mut missing = self.leader_missing.lock().unwrap();
+        LEADER_MISSING.set(missing.len() as i64);
+        missing.clear();
     }
 }

@@ -1,19 +1,8 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::{Json, Result};
-use coprocessor::codec::convert;
-use coprocessor::dag::expr::EvalContext;
+use crate::coprocessor::codec::convert;
+use crate::coprocessor::dag::expr::EvalContext;
 
 impl Json {
     pub fn cast_to_int(&self) -> i64 {
@@ -42,9 +31,9 @@ impl Json {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use coprocessor::dag::expr::{EvalConfig, EvalContext};
+    use crate::coprocessor::dag::expr::{EvalConfig, EvalContext};
     use std::f64;
     use std::sync::Arc;
 

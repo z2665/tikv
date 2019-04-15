@@ -1,20 +1,9 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::slice::Iter;
 
 use super::{EvalContext, Result, ScalarFunc};
-use coprocessor::codec::Datum;
+use crate::coprocessor::codec::Datum;
 use regex::{bytes::Regex as BytesRegex, Regex};
 
 const MAX_RECURSE_LEVEL: usize = 1024;
@@ -51,7 +40,7 @@ impl ScalarFunc {
 
 // Do match until '%' is found.
 #[inline]
-fn partial_like(tcs: &mut Iter<u8>, pcs: &mut Iter<u8>, escape: u32) -> Option<bool> {
+fn partial_like(tcs: &mut Iter<'_, u8>, pcs: &mut Iter<'_, u8>, escape: u32) -> Option<bool> {
     loop {
         match pcs.next().cloned() {
             None => return Some(tcs.next().is_none()),
@@ -84,9 +73,11 @@ fn like(target: &[u8], pattern: &[u8], escape: u32, recurse_level: usize) -> Res
         let next_char = loop {
             match pcs.next().cloned() {
                 Some(b'%') => {}
-                Some(b'_') => if tcs.next().is_none() {
-                    return Ok(false);
-                },
+                Some(b'_') => {
+                    if tcs.next().is_none() {
+                        return Ok(false);
+                    }
+                }
                 // So the pattern should be some thing like 'xxx%'
                 None => return Ok(true),
                 Some(c) => {
@@ -119,10 +110,10 @@ fn like(target: &[u8], pattern: &[u8], escape: u32, recurse_level: usize) -> Res
 }
 
 #[cfg(test)]
-mod test {
-    use coprocessor::codec::Datum;
-    use coprocessor::dag::expr::test::{datum_expr, scalar_func_expr};
-    use coprocessor::dag::expr::{EvalContext, Expression};
+mod tests {
+    use crate::coprocessor::codec::Datum;
+    use crate::coprocessor::dag::expr::tests::{datum_expr, scalar_func_expr};
+    use crate::coprocessor::dag::expr::{EvalContext, Expression};
     use tipb::expression::ScalarFuncSig;
 
     #[test]
@@ -165,7 +156,7 @@ mod test {
             let pattern = datum_expr(Datum::Bytes(pattern_str.as_bytes().to_vec()));
             let escape = datum_expr(Datum::I64(escape as i64));
             let op = scalar_func_expr(ScalarFuncSig::LikeSig, &[target, pattern, escape]);
-            let op = Expression::build(&mut ctx, op).unwrap();
+            let op = Expression::build(&ctx, op).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             let exp = Datum::from(exp);
             assert_eq!(got, exp, "{:?} like {:?}", target_str, pattern_str);
@@ -194,7 +185,7 @@ mod test {
             let target = datum_expr(Datum::Bytes(target_str.as_bytes().to_vec()));
             let pattern = datum_expr(Datum::Bytes(pattern_str.as_bytes().to_vec()));
             let op = scalar_func_expr(ScalarFuncSig::RegexpSig, &[target, pattern]);
-            let op = Expression::build(&mut ctx, op).unwrap();
+            let op = Expression::build(&ctx, op).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             let exp = Datum::from(exp);
             assert_eq!(got, exp, "{:?} rlike {:?}", target_str, pattern_str);
@@ -231,7 +222,7 @@ mod test {
             let target = datum_expr(Datum::Bytes(target_str.clone()));
             let pattern = datum_expr(Datum::Bytes(pattern_str.as_bytes().to_vec()));
             let op = scalar_func_expr(ScalarFuncSig::RegexpBinarySig, &[target, pattern]);
-            let op = Expression::build(&mut ctx, op).unwrap();
+            let op = Expression::build(&ctx, op).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             let exp = Datum::from(exp);
             assert_eq!(got, exp, "{:?} binary rlike {:?}", target_str, pattern_str);

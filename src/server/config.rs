@@ -1,43 +1,37 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::i32;
 
 use super::Result;
-use grpc::CompressionAlgorithms;
+use crate::grpc::CompressionAlgorithms;
 
-use coprocessor::DEFAULT_REQUEST_MAX_HANDLE_SECS;
-use util::collections::HashMap;
-use util::config::{self, ReadableDuration, ReadableSize};
-use util::io_limiter::DEFAULT_SNAP_MAX_BYTES_PER_SEC;
+use tikv_util::collections::HashMap;
+use tikv_util::config::{self, ReadableDuration, ReadableSize};
+use tikv_util::io_limiter::DEFAULT_SNAP_MAX_BYTES_PER_SEC;
 
-pub use raftstore::store::Config as RaftStoreConfig;
-pub use storage::Config as StorageConfig;
+pub use crate::raftstore::store::Config as RaftStoreConfig;
+pub use crate::storage::Config as StorageConfig;
 
 pub const DEFAULT_CLUSTER_ID: u64 = 0;
 pub const DEFAULT_LISTENING_ADDR: &str = "127.0.0.1:20160";
 const DEFAULT_ADVERTISE_LISTENING_ADDR: &str = "";
+const DEFAULT_STATUS_ADDR: &str = "127.0.0.1:20180";
 const DEFAULT_GRPC_CONCURRENCY: usize = 4;
 const DEFAULT_GRPC_CONCURRENT_STREAM: i32 = 1024;
-const DEFAULT_GRPC_RAFT_CONN_NUM: usize = 10;
+const DEFAULT_GRPC_RAFT_CONN_NUM: usize = 1;
 const DEFAULT_GRPC_STREAM_INITIAL_WINDOW_SIZE: u64 = 2 * 1024 * 1024;
 
 // Number of rows in each chunk.
-pub const DEFAULT_ENDPOINT_BATCH_ROW_LIMIT: usize = 64;
+const DEFAULT_ENDPOINT_BATCH_ROW_LIMIT: usize = 64;
+
+// If a request has been handled for more than 60 seconds, the client should
+// be timeout already, so it can be safely aborted.
+const DEFAULT_ENDPOINT_REQUEST_MAX_HANDLE_SECS: u64 = 60;
 
 // Number of rows in each chunk for streaming coprocessor.
-pub const DEFAULT_ENDPOINT_STREAM_BATCH_ROW_LIMIT: usize = 128;
+const DEFAULT_ENDPOINT_STREAM_BATCH_ROW_LIMIT: usize = 128;
 
+/// A clone of `grpc::CompressionAlgorithms` with serde supports.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GrpcCompressionType {
@@ -46,6 +40,7 @@ pub enum GrpcCompressionType {
     Gzip,
 }
 
+/// Configuration for the `server` module.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
@@ -59,6 +54,10 @@ pub struct Config {
     // Server advertise listening address for outer communication.
     // If not set, we will use listening address instead.
     pub advertise_addr: String,
+
+    // These are related to TiKV status.
+    pub status_addr: String,
+    pub status_thread_pool_size: usize,
 
     // TODO: use CompressionAlgorithms instead once it supports traits like Clone etc.
     pub grpc_compression_type: GrpcCompressionType,
@@ -76,9 +75,13 @@ pub struct Config {
     pub end_point_stream_channel_size: usize,
     pub end_point_batch_row_limit: usize,
     pub end_point_stream_batch_row_limit: usize,
+    pub end_point_enable_batch_if_possible: bool,
     pub end_point_request_max_handle_duration: ReadableDuration,
     pub snap_max_write_bytes_per_sec: ReadableSize,
     pub snap_max_total_size: ReadableSize,
+    pub stats_concurrency: usize,
+    pub heavy_load_threshold: usize,
+    pub heavy_load_wait_duration: ReadableDuration,
 
     // Server labels to specify some attributes about this server.
     pub labels: HashMap<String, String>,
@@ -106,6 +109,8 @@ impl Default for Config {
             addr: DEFAULT_LISTENING_ADDR.to_owned(),
             labels: HashMap::default(),
             advertise_addr: DEFAULT_ADVERTISE_LISTENING_ADDR.to_owned(),
+            status_addr: DEFAULT_STATUS_ADDR.to_owned(),
+            status_thread_pool_size: 1,
             grpc_compression_type: GrpcCompressionType::None,
             grpc_concurrency: DEFAULT_GRPC_CONCURRENCY,
             grpc_concurrent_stream: DEFAULT_GRPC_CONCURRENT_STREAM,
@@ -124,22 +129,33 @@ impl Default for Config {
             end_point_stream_channel_size: 8,
             end_point_batch_row_limit: DEFAULT_ENDPOINT_BATCH_ROW_LIMIT,
             end_point_stream_batch_row_limit: DEFAULT_ENDPOINT_STREAM_BATCH_ROW_LIMIT,
+            end_point_enable_batch_if_possible: true,
             end_point_request_max_handle_duration: ReadableDuration::secs(
-                DEFAULT_REQUEST_MAX_HANDLE_SECS,
+                DEFAULT_ENDPOINT_REQUEST_MAX_HANDLE_SECS,
             ),
             snap_max_write_bytes_per_sec: ReadableSize(DEFAULT_SNAP_MAX_BYTES_PER_SEC),
             snap_max_total_size: ReadableSize(0),
+            stats_concurrency: 1,
+            // 300 means gRPC threads are under heavy load if their total CPU usage
+            // is greater than 300%.
+            heavy_load_threshold: 300,
+            // The resolution of timer in tokio is 1ms.
+            heavy_load_wait_duration: ReadableDuration::millis(1),
         }
     }
 }
 
 impl Config {
+    /// Validates the configuration and returns an error if it is misconfigured.
     pub fn validate(&mut self) -> Result<()> {
         box_try!(config::check_addr(&self.addr));
         if !self.advertise_addr.is_empty() {
             box_try!(config::check_addr(&self.advertise_addr));
         } else {
-            info!("no advertise-addr is specified, fall back to addr.");
+            info!(
+                "no advertise-addr is specified, falling back to default addr";
+                "addr" => %self.addr
+            );
             self.advertise_addr = self.addr.clone();
         }
         if self.advertise_addr.starts_with("0.") {
@@ -148,7 +164,15 @@ impl Config {
                 self.advertise_addr
             ));
         }
-
+        if !self.status_addr.is_empty() {
+            box_try!(config::check_addr(&self.status_addr));
+        }
+        if self.status_addr == self.advertise_addr {
+            return Err(box_err!(
+                "status-addr has already been used: {:?}",
+                self.advertise_addr
+            ));
+        }
         let non_zero_entries = vec![
             (
                 "concurrent-send-snap-limit",
@@ -169,7 +193,9 @@ impl Config {
             return Err(box_err!("server.end-point-recursion-limit is too small"));
         }
 
-        if self.end_point_request_max_handle_duration.as_secs() < DEFAULT_REQUEST_MAX_HANDLE_SECS {
+        if self.end_point_request_max_handle_duration.as_secs()
+            < DEFAULT_ENDPOINT_REQUEST_MAX_HANDLE_SECS
+        {
             return Err(box_err!(
                 "server.end-point-request-max-handle-secs is too small."
             ));
@@ -189,6 +215,7 @@ impl Config {
         Ok(())
     }
 
+    /// Gets configured grpc compression algorithm.
     pub fn grpc_compression_algorithm(&self) -> CompressionAlgorithms {
         match self.grpc_compression_type {
             GrpcCompressionType::None => CompressionAlgorithms::None,
@@ -232,7 +259,7 @@ fn validate_label(s: &str, tp: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use util::config::ReadableDuration;
+    use tikv_util::config::ReadableDuration;
 
     #[test]
     fn test_config_validate() {
@@ -262,6 +289,11 @@ mod tests {
         assert!(invalid_cfg.validate().is_err());
         invalid_cfg.advertise_addr = "127.0.0.1:1000".to_owned();
         invalid_cfg.validate().unwrap();
+
+        let mut invalid_cfg = cfg.clone();
+        invalid_cfg.advertise_addr = "127.0.0.1:1000".to_owned();
+        invalid_cfg.status_addr = "127.0.0.1:1000".to_owned();
+        assert!(invalid_cfg.validate().is_err());
 
         let mut invalid_cfg = cfg.clone();
         invalid_cfg.grpc_stream_initial_window_size = ReadableSize(i32::MAX as u64 + 1);

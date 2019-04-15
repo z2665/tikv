@@ -1,31 +1,18 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 //! Core data types.
 
-use std::cmp::Ordering;
 use std::fmt::{self, Display, Formatter};
-use std::hash::{Hash, Hasher};
 use std::u64;
 
 use byteorder::{ByteOrder, NativeEndian};
+use hex::ToHex;
 
-use util::codec::bytes;
-use util::codec::number::{self, NumberEncoder};
-use util::{codec, escape};
-
-use storage::mvcc::{Lock, Write};
-
+use crate::storage::mvcc::{Lock, Write};
+use tikv_util::codec;
+use tikv_util::codec::bytes;
+use tikv_util::codec::bytes::BytesEncoder;
+use tikv_util::codec::number::{self, NumberEncoder};
 /// Value type which is essentially raw bytes.
 pub type Value = Vec<u8>;
 
@@ -56,7 +43,7 @@ pub struct MvccInfo {
 /// Orthogonal to binary representation, keys may or may not embed a timestamp,
 /// but this information is transparent to this type, the caller must use it
 /// consistently.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Key(Vec<u8>);
 
 /// Core functions for `Key`.
@@ -64,7 +51,11 @@ impl Key {
     /// Creates a key from raw bytes.
     #[inline]
     pub fn from_raw(key: &[u8]) -> Key {
-        Key(codec::bytes::encode_bytes(key))
+        // adding extra length for appending timestamp
+        let len = codec::bytes::max_encoded_bytes_size(key.len()) + codec::number::U64_SIZE;
+        let mut encoded = Vec::with_capacity(len);
+        encoded.encode_bytes(key, false).unwrap();
+        Key(encoded)
     }
 
     /// Gets and moves the raw representation of this key.
@@ -184,13 +175,12 @@ impl Key {
     /// Whether the user key part of a ts encoded key `ts_encoded_key` equals to the encoded
     /// user key `user_key`.
     ///
-    /// There is an optimziation in this function, which is to compare the last 8 encoded bytes
+    /// There is an optimization in this function, which is to compare the last 8 encoded bytes
     /// first before comparing the rest. It is because in TiDB many records are ended with an 8
     /// byte row id and in many situations only this part is different when calling this function.
     //
     // TODO: If the last 8 byte is memory aligned, it would be better.
     #[inline]
-    #[cfg_attr(feature = "cargo-clippy", allow(cast_ptr_alignment))]
     pub fn is_user_key_eq(ts_encoded_key: &[u8], user_key: &[u8]) -> bool {
         let user_key_len = user_key.len();
         if ts_encoded_key.len() != user_key_len + number::U64_SIZE {
@@ -222,30 +212,9 @@ impl Clone for Key {
     }
 }
 
-/// Hash for `Key`.
-impl Hash for Key {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_encoded().hash(state)
-    }
-}
-
-/// Display for `Key`.
 impl Display for Key {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", escape(&self.0))
-    }
-}
-
-/// Partial equality for `Key`.
-impl PartialEq for Key {
-    fn eq(&self, other: &Key) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl PartialOrd for Key {
-    fn partial_cmp(&self, other: &Key) -> Option<Ordering> {
-        Some(self.0.cmp(&other.0))
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.0.write_hex_upper(f)
     }
 }
 

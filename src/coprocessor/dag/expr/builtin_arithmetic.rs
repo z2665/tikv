@@ -1,22 +1,13 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use super::{Error, EvalContext, Result, ScalarFunc};
-use coprocessor::codec::mysql::{Decimal, Res};
-use coprocessor::codec::{div_i64, div_i64_with_u64, div_u64_with_i64, mysql, Datum};
 use std::borrow::Cow;
 use std::ops::{Add, Mul, Sub};
 use std::{f64, i64, u64};
+
+use crate::coprocessor::codec::mysql::{Decimal, Res};
+use crate::coprocessor::codec::{div_i64, div_i64_with_u64, div_u64_with_i64, Datum};
+
+use super::{Error, EvalContext, Result, ScalarFunc};
 
 impl ScalarFunc {
     pub fn plus_real(&self, ctx: &mut EvalContext, row: &[Datum]) -> Result<Option<f64>> {
@@ -43,24 +34,28 @@ impl ScalarFunc {
     pub fn plus_int(&self, ctx: &mut EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         let lhs = try_opt!(self.children[0].eval_int(ctx, row));
         let rhs = try_opt!(self.children[1].eval_int(ctx, row));
-        let lus = mysql::has_unsigned_flag(self.children[0].get_tp().get_flag());
-        let rus = mysql::has_unsigned_flag(self.children[1].get_tp().get_flag());
+        let lus = self.children[0].is_unsigned();
+        let rus = self.children[1].is_unsigned();
         let res = match (lus, rus) {
             (true, true) => (lhs as u64).checked_add(rhs as u64).map(|t| t as i64),
-            (true, false) => if rhs >= 0 {
-                (lhs as u64).checked_add(rhs as u64).map(|t| t as i64)
-            } else {
-                (lhs as u64)
-                    .checked_sub(rhs.overflowing_neg().0 as u64)
-                    .map(|t| t as i64)
-            },
-            (false, true) => if lhs >= 0 {
-                (lhs as u64).checked_add(rhs as u64).map(|t| t as i64)
-            } else {
-                (rhs as u64)
-                    .checked_sub(lhs.overflowing_neg().0 as u64)
-                    .map(|t| t as i64)
-            },
+            (true, false) => {
+                if rhs >= 0 {
+                    (lhs as u64).checked_add(rhs as u64).map(|t| t as i64)
+                } else {
+                    (lhs as u64)
+                        .checked_sub(rhs.overflowing_neg().0 as u64)
+                        .map(|t| t as i64)
+                }
+            }
+            (false, true) => {
+                if lhs >= 0 {
+                    (lhs as u64).checked_add(rhs as u64).map(|t| t as i64)
+                } else {
+                    (rhs as u64)
+                        .checked_sub(lhs.overflowing_neg().0 as u64)
+                        .map(|t| t as i64)
+                }
+            }
             (false, false) => lhs.checked_add(rhs),
         };
         let data_type = if lus | rus {
@@ -96,8 +91,8 @@ impl ScalarFunc {
     pub fn minus_int(&self, ctx: &mut EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         let lhs = try_opt!(self.children[0].eval_int(ctx, row));
         let rhs = try_opt!(self.children[1].eval_int(ctx, row));
-        let lus = mysql::has_unsigned_flag(self.children[0].get_tp().get_flag());
-        let rus = mysql::has_unsigned_flag(self.children[1].get_tp().get_flag());
+        let lus = self.children[0].is_unsigned();
+        let rus = self.children[1].is_unsigned();
         let data_type = if lus | rus {
             "BIGINT UNSIGNED"
         } else {
@@ -105,18 +100,22 @@ impl ScalarFunc {
         };
         let res = match (lus, rus) {
             (true, true) => (lhs as u64).checked_sub(rhs as u64).map(|t| t as i64),
-            (true, false) => if rhs >= 0 {
-                (lhs as u64).checked_sub(rhs as u64).map(|t| t as i64)
-            } else {
-                (lhs as u64)
-                    .checked_add(rhs.overflowing_neg().0 as u64)
-                    .map(|t| t as i64)
-            },
-            (false, true) => if lhs >= 0 {
-                (lhs as u64).checked_sub(rhs as u64).map(|t| t as i64)
-            } else {
-                return Err(Error::overflow(data_type, &format!("({} - {})", lhs, rhs)));
-            },
+            (true, false) => {
+                if rhs >= 0 {
+                    (lhs as u64).checked_sub(rhs as u64).map(|t| t as i64)
+                } else {
+                    (lhs as u64)
+                        .checked_add(rhs.overflowing_neg().0 as u64)
+                        .map(|t| t as i64)
+                }
+            }
+            (false, true) => {
+                if lhs >= 0 {
+                    (lhs as u64).checked_sub(rhs as u64).map(|t| t as i64)
+                } else {
+                    return Err(Error::overflow(data_type, &format!("({} - {})", lhs, rhs)));
+                }
+            }
             (false, false) => lhs.checked_sub(rhs),
         };
         res.ok_or_else(|| Error::overflow(data_type, &format!("({} - {})", lhs, rhs)))
@@ -147,8 +146,8 @@ impl ScalarFunc {
     pub fn multiply_int(&self, ctx: &mut EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         let lhs = try_opt!(self.children[0].eval_int(ctx, row));
         let rhs = try_opt!(self.children[1].eval_int(ctx, row));
-        let lus = mysql::has_unsigned_flag(self.children[0].get_tp().get_flag());
-        let rus = mysql::has_unsigned_flag(self.children[1].get_tp().get_flag());
+        let lus = self.children[0].is_unsigned();
+        let rus = self.children[1].is_unsigned();
         let u64_mul_i64 = |u, s| {
             if s >= 0 {
                 (u as u64).checked_mul(s as u64).map(|t| t as i64)
@@ -216,10 +215,10 @@ impl ScalarFunc {
         if rhs == 0 {
             return Ok(None);
         }
-        let rus = mysql::has_unsigned_flag(self.children[1].get_tp().get_flag());
+        let rus = self.children[1].is_unsigned();
 
         let lhs = try_opt!(self.children[0].eval_int(ctx, row));
-        let lus = mysql::has_unsigned_flag(self.children[0].get_tp().get_flag());
+        let lus = self.children[0].is_unsigned();
 
         let res = match (lus, rus) {
             (true, true) => Ok(((lhs as u64) / (rhs as u64)) as i64),
@@ -276,10 +275,10 @@ impl ScalarFunc {
         if rhs == 0 {
             return Ok(None);
         }
-        let rus = mysql::has_unsigned_flag(self.children[1].get_tp().get_flag());
+        let rus = self.children[1].is_unsigned();
 
         let lhs = try_opt!(self.children[0].eval_int(ctx, row));
-        let lus = mysql::has_unsigned_flag(self.children[0].get_tp().get_flag());
+        let lus = self.children[0].is_unsigned();
 
         let res = match (lus, rus) {
             (true, true) => ((lhs as u64) % (rhs as u64)) as i64,
@@ -292,17 +291,19 @@ impl ScalarFunc {
 }
 
 #[cfg(test)]
-mod test {
-    use coprocessor::codec::error::ERR_DIVISION_BY_ZERO;
-    use coprocessor::codec::mysql::{types, Decimal};
-    use coprocessor::codec::{mysql, Datum};
-    use coprocessor::dag::expr::test::{
+mod tests {
+    use std::{f64, i64, u64};
+
+    use cop_datatype::FieldTypeFlag;
+    use tipb::expression::ScalarFuncSig;
+
+    use crate::coprocessor::codec::error::ERR_DIVISION_BY_ZERO;
+    use crate::coprocessor::codec::mysql::Decimal;
+    use crate::coprocessor::codec::Datum;
+    use crate::coprocessor::dag::expr::tests::{
         check_divide_by_zero, check_overflow, datum_expr, scalar_func_expr, str2dec,
     };
-    use coprocessor::dag::expr::*;
-    use std::sync::Arc;
-    use std::{f64, i64, u64};
-    use tipb::expression::ScalarFuncSig;
+    use crate::coprocessor::dag::expr::*;
 
     #[test]
     fn test_arithmetic_int() {
@@ -535,14 +536,22 @@ mod test {
             let lhs = datum_expr(tt.1);
             let rhs = datum_expr(tt.2);
 
-            let lus = mysql::has_unsigned_flag(lhs.get_field_type().get_flag());
-            let rus = mysql::has_unsigned_flag(rhs.get_field_type().get_flag());
+            let lus = lhs
+                .get_field_type()
+                .flag()
+                .contains(FieldTypeFlag::UNSIGNED);
+            let rus = rhs
+                .get_field_type()
+                .flag()
+                .contains(FieldTypeFlag::UNSIGNED);
             let unsigned = lus | rus;
 
-            let mut op = Expression::build(&mut ctx, scalar_func_expr(tt.0, &[lhs, rhs])).unwrap();
+            let mut op = Expression::build(&ctx, scalar_func_expr(tt.0, &[lhs, rhs])).unwrap();
             if unsigned {
                 // According to TiDB, the result is unsigned if any of arguments is unsigned.
-                op.mut_tp().set_flag(types::UNSIGNED_FLAG as u32);
+                op.mut_field_type()
+                    .as_mut_accessor()
+                    .set_flag(FieldTypeFlag::UNSIGNED);
             }
 
             let got = op.eval(&mut ctx, &[]).unwrap();
@@ -643,7 +652,7 @@ mod test {
             let lhs = datum_expr(tt.1);
             let rhs = datum_expr(tt.2);
 
-            let op = Expression::build(&mut ctx, scalar_func_expr(tt.0, &[lhs, rhs])).unwrap();
+            let op = Expression::build(&ctx, scalar_func_expr(tt.0, &[lhs, rhs])).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             assert_eq!(got, tt.3);
         }
@@ -868,7 +877,7 @@ mod test {
             let lhs = datum_expr(tt.1);
             let rhs = datum_expr(tt.2);
 
-            let op = Expression::build(&mut ctx, scalar_func_expr(tt.0, &[lhs, rhs])).unwrap();
+            let op = Expression::build(&ctx, scalar_func_expr(tt.0, &[lhs, rhs])).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap();
             assert_eq!(got, tt.3);
         }
@@ -941,14 +950,22 @@ mod test {
             let lhs = datum_expr(tt.1);
             let rhs = datum_expr(tt.2);
 
-            let lus = mysql::has_unsigned_flag(lhs.get_field_type().get_flag());
-            let rus = mysql::has_unsigned_flag(rhs.get_field_type().get_flag());
+            let lus = lhs
+                .get_field_type()
+                .flag()
+                .contains(FieldTypeFlag::UNSIGNED);
+            let rus = rhs
+                .get_field_type()
+                .flag()
+                .contains(FieldTypeFlag::UNSIGNED);
             let unsigned = lus | rus;
 
-            let mut op = Expression::build(&mut ctx, scalar_func_expr(tt.0, &[lhs, rhs])).unwrap();
+            let mut op = Expression::build(&ctx, scalar_func_expr(tt.0, &[lhs, rhs])).unwrap();
             if unsigned {
                 // According to TiDB, the result is unsigned if any of arguments is unsigned.
-                op.mut_tp().set_flag(types::UNSIGNED_FLAG as u32);
+                op.mut_field_type()
+                    .as_mut_accessor()
+                    .set_flag(FieldTypeFlag::UNSIGNED);
             }
 
             let got = op.eval(&mut ctx, &[]).unwrap_err();
@@ -979,10 +996,13 @@ mod test {
             let rhs = datum_expr(right);
 
             let mut op = Expression::build(
-                &mut ctx,
+                &ctx,
                 scalar_func_expr(ScalarFuncSig::MultiplyIntUnsigned, &[lhs, rhs]),
-            ).unwrap();
-            op.mut_tp().set_flag(types::UNSIGNED_FLAG as u32);
+            )
+            .unwrap();
+            op.mut_field_type()
+                .as_mut_accessor()
+                .set_flag(FieldTypeFlag::UNSIGNED);
 
             let got = op.eval(&mut ctx, &[]).unwrap();
             assert_eq!(got, exp);
@@ -1000,10 +1020,13 @@ mod test {
             let rhs = datum_expr(right);
 
             let mut op = Expression::build(
-                &mut ctx,
+                &ctx,
                 scalar_func_expr(ScalarFuncSig::MultiplyIntUnsigned, &[lhs, rhs]),
-            ).unwrap();
-            op.mut_tp().set_flag(types::UNSIGNED_FLAG as u32);
+            )
+            .unwrap();
+            op.mut_field_type()
+                .as_mut_accessor()
+                .set_flag(FieldTypeFlag::UNSIGNED);
 
             let got = op.eval(&mut ctx, &[]).unwrap_err();
             assert!(check_overflow(got).is_ok());
@@ -1039,7 +1062,7 @@ mod test {
             let lhs = datum_expr(tt.1);
             let rhs = datum_expr(tt.2);
 
-            let op = Expression::build(&mut ctx, scalar_func_expr(tt.0, &[lhs, rhs])).unwrap();
+            let op = Expression::build(&ctx, scalar_func_expr(tt.0, &[lhs, rhs])).unwrap();
             let got = op.eval(&mut ctx, &[]).unwrap_err();
             assert!(check_overflow(got).is_ok());
         }
@@ -1071,20 +1094,23 @@ mod test {
         ];
 
         let cases = vec![
-            //(flag,sql_mode,strict_sql_mode=>is_ok,has_warning)
-            (0, 0, false, true, true), //warning
+            //(flag,sql_mode,is_ok,has_warning)
+            (0, SqlMode::empty(), true, true), //warning
             (
                 FLAG_IN_UPDATE_OR_DELETE_STMT,
-                MODE_ERROR_FOR_DIVISION_BY_ZERO,
-                true,
+                SqlMode::ERROR_FOR_DIVISION_BY_ZERO | SqlMode::STRICT_ALL_TABLES,
                 false,
                 false,
             ), //error
-            (FLAG_IN_UPDATE_OR_DELETE_STMT, 0, true, true, false), //ok
+            (
+                FLAG_IN_UPDATE_OR_DELETE_STMT,
+                SqlMode::STRICT_ALL_TABLES,
+                true,
+                false,
+            ), //ok
             (
                 FLAG_IN_UPDATE_OR_DELETE_STMT | FLAG_DIVIDED_BY_ZERO_AS_WARNING,
-                MODE_ERROR_FOR_DIVISION_BY_ZERO,
-                true,
+                SqlMode::ERROR_FOR_DIVISION_BY_ZERO | SqlMode::STRICT_ALL_TABLES,
                 true,
                 true,
             ), //warning
@@ -1093,13 +1119,11 @@ mod test {
             let lhs = datum_expr(left);
             let rhs = datum_expr(right);
             let scalar_func = scalar_func_expr(sig, &[lhs, rhs]);
-            for (flag, sql_mode, strict_sql_mode, is_ok, has_warning) in &cases {
-                let cfg = EvalConfig::new()
-                    .set_by_flags(*flag)
-                    .set_sql_mode(*sql_mode)
-                    .set_strict_sql_mode(*strict_sql_mode);
-                let mut ctx = EvalContext::new(Arc::new(cfg));
-                let op = Expression::build(&mut ctx, scalar_func.clone()).unwrap();
+            for (flag, sql_mode, is_ok, has_warning) in &cases {
+                let mut cfg = EvalConfig::new();
+                cfg.set_by_flags(*flag).set_sql_mode(*sql_mode);
+                let mut ctx = EvalContext::new(::std::sync::Arc::new(cfg));
+                let op = Expression::build(&ctx, scalar_func.clone()).unwrap();
                 let got = op.eval(&mut ctx, &[]);
                 if *is_ok {
                     assert_eq!(got.unwrap(), Datum::Null);

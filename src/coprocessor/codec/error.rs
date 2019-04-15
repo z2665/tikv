@@ -1,19 +1,7 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use coprocessor::codec::mysql::Time;
-use coprocessor::dag::expr::EvalContext;
-use std::borrow::Cow;
+use crate::coprocessor::dag::expr::EvalContext;
+use regex::Error as RegexpError;
 use std::error::Error as StdError;
 use std::io;
 use std::str::Utf8Error;
@@ -22,12 +10,10 @@ use std::{error, str};
 use tipb::expression::ScalarFuncSig;
 use tipb::select;
 
-use regex::Error as RegexpError;
-
-use util;
-
 pub const ERR_UNKNOWN: i32 = 1105;
 pub const ERR_REGEXP: i32 = 1139;
+pub const ZLIB_LENGTH_CORRUPTED: i32 = 1258;
+pub const ZLIB_DATA_CORRUPTED: i32 = 1259;
 pub const WARN_DATA_TRUNCATED: i32 = 1265;
 pub const ERR_TRUNCATE_WRONG_VALUE: i32 = 1292;
 pub const ERR_UNKNOWN_TIMEZONE: i32 = 1298;
@@ -59,32 +45,31 @@ quick_error! {
             description("evaluation failed")
             display("{}", s)
         }
-        Other(err: Box<error::Error + Send + Sync>) {
+        Other(err: Box<dyn error::Error + Send + Sync>) {
             from()
             cause(err.as_ref())
             description(err.description())
-            display("unknown error {:?}", err)
+            display("{}", err)
         }
     }
 }
 
 impl Error {
-    pub fn handle_invalid_time_error<'a>(
-        ctx: &mut EvalContext,
-        err: Error,
-    ) -> Result<Option<Cow<'a, Time>>> {
+    pub fn handle_invalid_time_error(ctx: &mut EvalContext, err: Error) -> Result<()> {
         if err.code() == ERR_TRUNCATE_WRONG_VALUE {
             return Err(err);
         }
-        if ctx.cfg.strict_sql_mode && (ctx.cfg.in_insert_stmt || ctx.cfg.in_update_or_delete_stmt) {
+        if ctx.cfg.sql_mode.is_strict()
+            && (ctx.cfg.in_insert_stmt || ctx.cfg.in_update_or_delete_stmt)
+        {
             return Err(err);
         }
         ctx.warnings.append_warning(err);
-        Ok(None)
+        Ok(())
     }
 
     pub fn overflow(data: &str, expr: &str) -> Error {
-        let msg = format!("{} value is out of range in {:?}", data, expr);
+        let msg = format!("{} value is out of range in '{}'", data, expr);
         Error::Eval(msg, ERR_DATA_OUT_OF_RANGE)
     }
 
@@ -138,7 +123,7 @@ impl Error {
     }
 
     pub fn unexpected_eof() -> Error {
-        util::codec::Error::unexpected_eof().into()
+        tikv_util::codec::Error::unexpected_eof().into()
     }
 
     pub fn invalid_time_format(val: &str) -> Error {
@@ -149,6 +134,15 @@ impl Error {
     pub fn incorrect_datetime_value(val: &str) -> Error {
         let msg = format!("Incorrect datetime value: '{}'", val);
         Error::Eval(msg, ERR_TRUNCATE_WRONG_VALUE)
+    }
+
+    pub fn zlib_length_corrupted() -> Error {
+        let msg = "ZLIB: Not enough room in the output buffer (probably, length of uncompressed data was corrupted)";
+        Error::Eval(msg.into(), ZLIB_LENGTH_CORRUPTED)
+    }
+
+    pub fn zlib_data_corrupted() -> Error {
+        Error::Eval("ZLIB: Input data corrupted".into(), ZLIB_DATA_CORRUPTED)
     }
 }
 
@@ -167,15 +161,15 @@ impl From<FromUtf8Error> for Error {
     }
 }
 
-impl From<util::codec::Error> for Error {
-    fn from(err: util::codec::Error) -> Error {
+impl From<tikv_util::codec::Error> for Error {
+    fn from(err: tikv_util::codec::Error) -> Error {
         box_err!("codec:{:?}", err)
     }
 }
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Error {
-        let uerr: util::codec::Error = err.into();
+        let uerr: tikv_util::codec::Error = err.into();
         uerr.into()
     }
 }
@@ -187,4 +181,4 @@ impl From<RegexpError> for Error {
     }
 }
 
-pub type Result<T> = ::std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;

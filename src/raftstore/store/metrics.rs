@@ -1,15 +1,4 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use prometheus::*;
 
@@ -67,13 +56,6 @@ lazy_static! {
         register_int_counter_vec!(
             "tikv_raftstore_raft_dropped_message_total",
             "Total number of raft dropped messages.",
-            &["type"]
-        ).unwrap();
-
-    pub static ref STORE_PD_HEARTBEAT_GAUGE_VEC: IntGaugeVec =
-        register_int_gauge_vec!(
-            "tikv_pd_heartbeat_tick_total",
-            "Total number of pd heartbeat ticks.",
             &["type"]
         ).unwrap();
 
@@ -184,14 +166,14 @@ lazy_static! {
         register_histogram!(
             "tikv_snapshot_kv_count",
             "Total number of kv in snapshot",
-             exponential_buckets(100.0, 2.0, 20).unwrap() //100,100*2^1,...100M
+            exponential_buckets(100.0, 2.0, 20).unwrap() //100,100*2^1,...100M
         ).unwrap();
 
     pub static ref SNAPSHOT_SIZE_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_snapshot_size",
             "Size of snapshot",
-             exponential_buckets(1024.0, 2.0, 22).unwrap() // 1024,1024*2^1,..,4G
+            exponential_buckets(1024.0, 2.0, 22).unwrap() // 1024,1024*2^1,..,4G
         ).unwrap();
 
     pub static ref RAFT_ENTRY_FETCHES: IntCounterVec =
@@ -199,14 +181,6 @@ lazy_static! {
             "tikv_raftstore_entry_fetches",
             "Total number of raft entry fetches",
             &["type"]
-        ).unwrap();
-
-    pub static ref BATCH_SNAPSHOT_COMMANDS: Histogram =
-        register_histogram!(
-            "tikv_raftstore_batch_snapshot_commands_total",
-            "Bucketed histogram of total size of batch snapshot commands",
-            vec![1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0,
-                 20.0, 24.0, 32.0, 64.0, 128.0, 256.0]
         ).unwrap();
 
     pub static ref LEADER_MISSING: IntGauge =
@@ -220,5 +194,20 @@ lazy_static! {
             "tikv_snapshot_ingest_sst_duration_seconds",
             "Bucketed histogram of rocksdb ingestion durations",
             exponential_buckets(0.005, 2.0, 20).unwrap()
+        ).unwrap();
+
+    pub static ref RAFT_INVALID_PROPOSAL_COUNTER_VEC: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_raft_invalid_proposal_total",
+            "Total number of raft invalid proposal.",
+            &["type"]
+        ).unwrap();
+
+    pub static ref RAFT_EVENT_DURATION: HistogramVec =
+        register_histogram_vec!(
+            "tikv_raftstore_event_duration",
+            "Duration of raft store events.",
+            &["type"],
+            exponential_buckets(0.001, 1.59, 20).unwrap() // max 10s
         ).unwrap();
 }

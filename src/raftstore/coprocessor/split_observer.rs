@@ -1,25 +1,14 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::{AdminObserver, Coprocessor, ObserverContext, Result as CopResult};
-use coprocessor::codec::table;
-use util::codec::bytes::{self, encode_bytes};
-use util::escape;
+use crate::coprocessor::codec::table;
+use tikv_util::codec::bytes::{self, encode_bytes};
+use tikv_util::escape;
 
+use crate::raftstore::store::util;
 use kvproto::metapb::Region;
 use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, SplitRequest};
 use protobuf::RepeatedField;
-use raftstore::store::util;
 use std::result::Result as StdResult;
 
 /// `SplitObserver` adjusts the split key so that it won't separate
@@ -65,7 +54,11 @@ impl SplitObserver {
         }
     }
 
-    fn on_split(&self, ctx: &mut ObserverContext, splits: &mut Vec<SplitRequest>) -> Result<()> {
+    fn on_split(
+        &self,
+        ctx: &mut ObserverContext<'_>,
+        splits: &mut Vec<SplitRequest>,
+    ) -> Result<()> {
         let (mut i, mut j) = (0, 0);
         let mut last_valid_key: Option<Vec<u8>> = None;
         let region_id = ctx.region().get_id();
@@ -79,11 +72,11 @@ impl SplitObserver {
                     Ok(key) => {
                         if last_valid_key.as_ref().map_or(false, |k| *k >= key) {
                             warn!(
-                                "[region {}] key {} is not larger than previous {} at {}, skip.",
-                                region_id,
-                                escape(&key),
-                                escape(last_valid_key.as_ref().unwrap()),
-                                k
+                                "key is not larger than previous, skip.";
+                                "region_id" => region_id,
+                                "key" => log_wrappers::Key(&key),
+                                "previous" => log_wrappers::Key(last_valid_key.as_ref().unwrap()),
+                                "index" => k,
                             );
                             continue;
                         }
@@ -91,7 +84,12 @@ impl SplitObserver {
                         split.set_split_key(key)
                     }
                     Err(e) => {
-                        warn!("[region {}] invalid key at {}, skip: {:?}", region_id, k, e);
+                        warn!(
+                            "invalid key, skip";
+                            "region_id" => region_id,
+                            "index" => k,
+                            "err" => ?e,
+                        );
                         continue;
                     }
                 }
@@ -114,7 +112,7 @@ impl Coprocessor for SplitObserver {}
 impl AdminObserver for SplitObserver {
     fn pre_propose_admin(
         &self,
-        ctx: &mut ObserverContext,
+        ctx: &mut ObserverContext<'_>,
         req: &mut AdminRequest,
     ) -> CopResult<()> {
         match req.get_cmd_type() {
@@ -129,9 +127,9 @@ impl AdminObserver for SplitObserver {
                 let mut request = vec![req.take_split()];
                 if let Err(e) = self.on_split(ctx, &mut request) {
                     error!(
-                        "[region {}] failed to handle split req: {:?}",
-                        ctx.region().get_id(),
-                        e
+                        "failed to handle split req";
+                        "region_id" => ctx.region().get_id(),
+                        "err" => ?e,
                     );
                     return Err(box_err!(e));
                 }
@@ -150,9 +148,9 @@ impl AdminObserver for SplitObserver {
                 let mut requests = req.mut_splits().take_requests().into_vec();
                 if let Err(e) = self.on_split(ctx, &mut requests) {
                     error!(
-                        "[region {}] failed to handle split req: {:?}",
-                        ctx.region().get_id(),
-                        e
+                        "failed to handle split req";
+                        "region_id" => ctx.region().get_id(),
+                        "err" => ?e,
                     );
                     return Err(box_err!(e));
                 }
@@ -166,15 +164,15 @@ impl AdminObserver for SplitObserver {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
+    use crate::coprocessor::codec::{datum, table, Datum};
+    use crate::raftstore::coprocessor::AdminObserver;
+    use crate::raftstore::coprocessor::ObserverContext;
     use byteorder::{BigEndian, WriteBytesExt};
-    use coprocessor::codec::{datum, table, Datum};
     use kvproto::metapb::Region;
     use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, SplitRequest};
-    use raftstore::coprocessor::AdminObserver;
-    use raftstore::coprocessor::ObserverContext;
-    use util::codec::bytes::encode_bytes;
+    use tikv_util::codec::bytes::encode_bytes;
 
     fn new_split_request(key: &[u8]) -> AdminRequest {
         let mut req = AdminRequest::new();

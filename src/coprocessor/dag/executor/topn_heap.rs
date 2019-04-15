@@ -1,15 +1,4 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cell::RefCell;
 use std::cmp::{self, Ordering};
@@ -18,9 +7,9 @@ use std::sync::Arc;
 use std::usize;
 use tipb::expression::ByItem;
 
-use coprocessor::codec::datum::Datum;
-use coprocessor::dag::executor::OriginCols;
-use coprocessor::dag::expr::{EvalContext, Result};
+use crate::coprocessor::codec::datum::Datum;
+use crate::coprocessor::dag::executor::OriginCols;
+use crate::coprocessor::dag::expr::{EvalContext, Result};
 
 const HEAP_MAX_CAPACITY: usize = 1024;
 
@@ -186,12 +175,12 @@ mod tests {
 
     use tipb::expression::{ByItem, Expr, ExprType};
 
-    use coprocessor::codec::table::RowColsDict;
-    use coprocessor::codec::Datum;
-    use coprocessor::dag::executor::OriginCols;
-    use coprocessor::dag::expr::EvalContext;
-    use util::codec::number::*;
-    use util::collections::HashMap;
+    use crate::coprocessor::codec::table::RowColsDict;
+    use crate::coprocessor::codec::Datum;
+    use crate::coprocessor::dag::executor::OriginCols;
+    use crate::coprocessor::dag::expr::EvalContext;
+    use tikv_util::codec::number::*;
+    use tikv_util::collections::HashMap;
 
     use super::*;
 
@@ -350,15 +339,13 @@ mod tests {
         let bad_key1: Vec<Datum> = vec![Datum::I64(2), Datum::Bytes(b"aaa".to_vec())];
         let row_data3 = RowColsDict::new(HashMap::default(), b"name:3".to_vec());
 
-        assert!(
-            topn_heap
-                .try_add_row(
-                    OriginCols::new(0 as i64, row_data3, Arc::default()),
-                    bad_key1,
-                    Arc::clone(&order_cols)
-                )
-                .is_err()
-        );
+        assert!(topn_heap
+            .try_add_row(
+                OriginCols::new(0 as i64, row_data3, Arc::default()),
+                bad_key1,
+                Arc::clone(&order_cols)
+            )
+            .is_err());
 
         assert!(topn_heap.into_sorted_vec().is_err());
     }

@@ -1,18 +1,4 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// FIXME: remove following later
-#![allow(dead_code)]
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{char, str, u32};
 
@@ -89,7 +75,7 @@ fn decode_escaped_unicode(s: &str) -> Result<char> {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
     use std::collections::BTreeMap;
 

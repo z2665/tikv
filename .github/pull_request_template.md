@@ -1,5 +1,5 @@
 <!--
-Thank you for contributing to TiKV! Please read TiKV's [CONTRIBUTING](https://github.com/pingcap/tikv/blob/master/CONTRIBUTING.md) document **BEFORE** filing this PR.
+Thank you for contributing to TiKV! Please read TiKV's [CONTRIBUTING](https://github.com/tikv/tikv/blob/master/CONTRIBUTING.md) document **BEFORE** filing this PR.
 -->
 
 ## What have you changed? (mandatory)
@@ -16,18 +16,19 @@ Please **NOTE** that:
 ## What are the type of the changes? (mandatory)
 
 The currently defined types are listed below, please pick one of the types for this PR by removing the others:
-- New feature (non-breaking change which adds functionality)
-- Improvement (non-breaking change which is an improvement to an existing feature)
-- Bug fix (non-breaking change which fixes an issue)
-- Breaking change (fix or feature that would cause existing functionality to not work as expected)
+- New feature (change which adds functionality)
+- Improvement (change which is an improvement to an existing feature)
+- Bug fix (change which fixes an issue)
+- Engineering (engineering change which doesn't change any feature or fix any issue)
+- Misc (other changes)
 
 ## How has this PR been tested? (mandatory)
 
 Please describe the tests that you ran to verify your changes. Have you finished unit tests, integration tests, or manual tests? What additional tests would give you greater confidence in this change?
 
-## Does this PR affect documentation (docs/docs-cn) update? (mandatory)
+## Does this PR affect documentation (docs) update? (mandatory)
 
-If there is document change, please file a PR in ([docs](https://github.com/pingcap/docs) or [docs-cn](https://github.com/pingcap/docs-cn)) and add the PR number here.
+If there is document change, please file a PR in ([docs](https://github.com/tikv/tikv/tree/master/docs)) and add the PR number here.
 
 ## Does this PR affect tidb-ansible update? (mandatory)
 

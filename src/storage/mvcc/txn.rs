@@ -1,27 +1,16 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::lock::{Lock, LockType};
 use super::metrics::*;
 use super::reader::MvccReader;
 use super::write::{Write, WriteType};
 use super::{Error, Result};
-use kvproto::kvrpcpb::IsolationLevel;
-use std::fmt;
-use storage::engine::{Modify, ScanMode, Snapshot};
-use storage::{
+use crate::storage::kv::{Modify, ScanMode, Snapshot};
+use crate::storage::{
     is_short_value, Key, Mutation, Options, Statistics, Value, CF_DEFAULT, CF_LOCK, CF_WRITE,
 };
+use kvproto::kvrpcpb::IsolationLevel;
+use std::fmt;
 
 pub const MAX_TXN_WRITE_SIZE: usize = 32 * 1024;
 
@@ -42,7 +31,7 @@ pub struct MvccTxn<S: Snapshot> {
 }
 
 impl<S: Snapshot> fmt::Debug for MvccTxn<S> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "txn @{}", self.start_ts)
     }
 }
@@ -115,28 +104,32 @@ impl<S: Snapshot> MvccTxn<S> {
         self.writes.push(Modify::Delete(CF_LOCK, key));
     }
 
-    fn put_value(&mut self, key: &Key, ts: u64, value: Value) {
-        let key = key.clone().append_ts(ts);
+    fn put_value(&mut self, key: Key, ts: u64, value: Value) {
+        let key = key.append_ts(ts);
         self.write_size += key.as_encoded().len() + value.len();
         self.writes.push(Modify::Put(CF_DEFAULT, key, value));
     }
 
-    fn delete_value(&mut self, key: &Key, ts: u64) {
-        let key = key.clone().append_ts(ts);
+    fn delete_value(&mut self, key: Key, ts: u64) {
+        let key = key.append_ts(ts);
         self.write_size += key.as_encoded().len();
         self.writes.push(Modify::Delete(CF_DEFAULT, key));
     }
 
-    fn put_write(&mut self, key: &Key, ts: u64, value: Value) {
-        let key = key.clone().append_ts(ts);
+    fn put_write(&mut self, key: Key, ts: u64, value: Value) {
+        let key = key.append_ts(ts);
         self.write_size += CF_WRITE.len() + key.as_encoded().len() + value.len();
         self.writes.push(Modify::Put(CF_WRITE, key, value));
     }
 
-    fn delete_write(&mut self, key: &Key, ts: u64) {
-        let key = key.clone().append_ts(ts);
+    fn delete_write(&mut self, key: Key, ts: u64) {
+        let key = key.append_ts(ts);
         self.write_size += CF_WRITE.len() + key.as_encoded().len();
         self.writes.push(Modify::Delete(CF_WRITE, key));
+    }
+
+    fn key_exist(&mut self, key: &Key, ts: u64) -> Result<bool> {
+        Ok(self.reader.get_write(&key, ts)?.is_some())
     }
 
     pub fn prewrite(
@@ -145,10 +138,17 @@ impl<S: Snapshot> MvccTxn<S> {
         primary: &[u8],
         options: &Options,
     ) -> Result<()> {
+        let lock_type = LockType::from_mutation(&mutation);
+        let (key, value, should_not_exist) = match mutation {
+            Mutation::Put((key, value)) => (key, Some(value), false),
+            Mutation::Delete(key) => (key, None, false),
+            Mutation::Lock(key) => (key, None, false),
+            Mutation::Insert((key, value)) => (key, Some(value), true),
+        };
+
         {
-            let key = mutation.key();
             if !options.skip_constraint_check {
-                if let Some((commit, _)) = self.reader.seek_write(key, u64::max_value())? {
+                if let Some((commit, write)) = self.reader.seek_write(&key, u64::max_value())? {
                     // Abort on writes after our start timestamp ...
                     // If exists a commit version whose commit timestamp is larger than or equal to
                     // current start timestamp, we should abort current prewrite, even if the commit
@@ -157,15 +157,24 @@ impl<S: Snapshot> MvccTxn<S> {
                         MVCC_CONFLICT_COUNTER.prewrite_write_conflict.inc();
                         return Err(Error::WriteConflict {
                             start_ts: self.start_ts,
-                            conflict_ts: commit,
+                            conflict_start_ts: write.start_ts,
+                            conflict_commit_ts: commit,
                             key: key.to_raw()?,
                             primary: primary.to_vec(),
                         });
                     }
+                    if should_not_exist {
+                        if write.write_type == WriteType::Put
+                            || (write.write_type != WriteType::Delete
+                                && self.key_exist(&key, write.start_ts - 1)?)
+                        {
+                            return Err(Error::AlreadyExist { key: key.to_raw()? });
+                        }
+                    }
                 }
             }
             // ... or locks at any timestamp.
-            if let Some(lock) = self.reader.load_lock(key)? {
+            if let Some(lock) = self.reader.load_lock(&key)? {
                 if lock.ts != self.start_ts {
                     return Err(Error::KeyIsLocked {
                         key: key.to_raw()?,
@@ -181,46 +190,35 @@ impl<S: Snapshot> MvccTxn<S> {
             }
         }
 
-        let lock_type = LockType::from_mutation(&mutation);
-
-        let (key, value) = match mutation {
-            Mutation::Put((key, value)) => (key, Some(value)),
-            Mutation::Delete(key) => (key, None),
-            Mutation::Lock(key) => (key, None),
-        };
-
-        if value.is_some() && is_short_value(value.as_ref().unwrap()) {
+        if value.is_none() || is_short_value(value.as_ref().unwrap()) {
             self.lock_key(key, lock_type, primary.to_vec(), options.lock_ttl, value);
         } else {
-            self.lock_key(
-                key.clone(),
-                lock_type,
-                primary.to_vec(),
-                options.lock_ttl,
-                None,
-            );
-            if value.is_some() {
-                let ts = self.start_ts;
-                self.put_value(&key, ts, value.unwrap());
-            }
+            // value is long
+            let ts = self.start_ts;
+            self.put_value(key.clone(), ts, value.unwrap());
+
+            self.lock_key(key, lock_type, primary.to_vec(), options.lock_ttl, None);
         }
+
         Ok(())
     }
 
-    pub fn commit(&mut self, key: &Key, commit_ts: u64) -> Result<()> {
-        let (lock_type, short_value) = match self.reader.load_lock(key)? {
+    pub fn commit(&mut self, key: Key, commit_ts: u64) -> Result<()> {
+        let (lock_type, short_value) = match self.reader.load_lock(&key)? {
             Some(ref mut lock) if lock.ts == self.start_ts => {
                 (lock.lock_type, lock.short_value.take())
             }
             _ => {
-                return match self.reader.get_txn_commit_info(key, self.start_ts)? {
+                return match self.reader.get_txn_commit_info(&key, self.start_ts)? {
                     Some((_, WriteType::Rollback)) | None => {
                         MVCC_CONFLICT_COUNTER.commit_lock_not_found.inc();
                         // None: related Rollback has been collapsed.
                         // Rollback: rollback by concurrent transaction.
                         info!(
-                            "txn conflict (lock not found), key:{}, start_ts:{}, commit_ts:{}",
-                            key, self.start_ts, commit_ts
+                            "txn conflict (lock not found)";
+                            "key" => %key,
+                            "start_ts" => self.start_ts,
+                            "commit_ts" => commit_ts,
                         );
                         Err(Error::TxnLockNotFound {
                             start_ts: self.start_ts,
@@ -243,21 +241,21 @@ impl<S: Snapshot> MvccTxn<S> {
             self.start_ts,
             short_value,
         );
-        self.put_write(key, commit_ts, write.to_bytes());
-        self.unlock_key(key.clone());
+        self.put_write(key.clone(), commit_ts, write.to_bytes());
+        self.unlock_key(key);
         Ok(())
     }
 
-    pub fn rollback(&mut self, key: &Key) -> Result<()> {
-        match self.reader.load_lock(key)? {
+    pub fn rollback(&mut self, key: Key) -> Result<()> {
+        match self.reader.load_lock(&key)? {
             Some(ref lock) if lock.ts == self.start_ts => {
                 // If prewrite type is DEL or LOCK, it is no need to delete value.
                 if lock.short_value.is_none() && lock.lock_type == LockType::Put {
-                    self.delete_value(key, lock.ts);
+                    self.delete_value(key.clone(), lock.ts);
                 }
             }
             _ => {
-                return match self.reader.get_txn_commit_info(key, self.start_ts)? {
+                return match self.reader.get_txn_commit_info(&key, self.start_ts)? {
                     Some((ts, write_type)) => {
                         if write_type == WriteType::Rollback {
                             // return Ok on Rollback already exist
@@ -266,8 +264,10 @@ impl<S: Snapshot> MvccTxn<S> {
                         } else {
                             MVCC_CONFLICT_COUNTER.rollback_committed.inc();
                             info!(
-                                "txn conflict (committed), key:{}, start_ts:{}, commit_ts:{}",
-                                key, self.start_ts, ts
+                                "txn conflict (committed)";
+                                "key" => %key,
+                                "start_ts" => self.start_ts,
+                                "commit_ts" => ts,
                             );
                             Err(Error::Committed { commit_ts: ts })
                         }
@@ -277,7 +277,7 @@ impl<S: Snapshot> MvccTxn<S> {
 
                         // collapse previous rollback if exist.
                         if self.collapse_rollback {
-                            self.collapse_prev_rollback(key)?;
+                            self.collapse_prev_rollback(key.clone())?;
                         }
 
                         // insert a Rollback to WriteCF when receives Rollback before Prewrite
@@ -290,7 +290,7 @@ impl<S: Snapshot> MvccTxn<S> {
         }
         let write = Write::new(WriteType::Rollback, self.start_ts, None);
         let ts = self.start_ts;
-        self.put_write(key, ts, write.to_bytes());
+        self.put_write(key.clone(), ts, write.to_bytes());
         self.unlock_key(key.clone());
         if self.collapse_rollback {
             self.collapse_prev_rollback(key)?;
@@ -298,8 +298,8 @@ impl<S: Snapshot> MvccTxn<S> {
         Ok(())
     }
 
-    fn collapse_prev_rollback(&mut self, key: &Key) -> Result<()> {
-        if let Some((commit_ts, write)) = self.reader.seek_write(key, self.start_ts)? {
+    fn collapse_prev_rollback(&mut self, key: Key) -> Result<()> {
+        if let Some((commit_ts, write)) = self.reader.seek_write(&key, self.start_ts)? {
             if write.write_type == WriteType::Rollback {
                 self.delete_write(key, commit_ts);
             }
@@ -307,14 +307,14 @@ impl<S: Snapshot> MvccTxn<S> {
         Ok(())
     }
 
-    pub fn gc(&mut self, key: &Key, safe_point: u64) -> Result<GcInfo> {
+    pub fn gc(&mut self, key: Key, safe_point: u64) -> Result<GcInfo> {
         let mut remove_older = false;
         let mut ts: u64 = u64::max_value();
         let mut found_versions = 0;
         let mut deleted_versions = 0;
         let mut latest_delete = None;
         let mut is_completed = true;
-        while let Some((commit, write)) = self.gc_reader.seek_write(key, ts)? {
+        while let Some((commit, write)) = self.gc_reader.seek_write(&key, ts)? {
             ts = commit - 1;
             found_versions += 1;
 
@@ -326,9 +326,9 @@ impl<S: Snapshot> MvccTxn<S> {
             }
 
             if remove_older {
-                self.delete_write(key, commit);
+                self.delete_write(key.clone(), commit);
                 if write.write_type == WriteType::Put && write.short_value.is_none() {
-                    self.delete_value(key, write.start_ts);
+                    self.delete_value(key.clone(), write.start_ts);
                 }
                 deleted_versions += 1;
                 continue;
@@ -353,7 +353,7 @@ impl<S: Snapshot> MvccTxn<S> {
                     latest_delete = Some(commit);
                 }
                 WriteType::Rollback | WriteType::Lock => {
-                    self.delete_write(key, commit);
+                    self.delete_write(key.clone(), commit);
                     deleted_versions += 1;
                 }
                 WriteType::Put => {}
@@ -378,16 +378,17 @@ impl<S: Snapshot> MvccTxn<S> {
 #[cfg(test)]
 mod tests {
     use kvproto::kvrpcpb::{Context, IsolationLevel};
-    use tempdir::TempDir;
 
-    use storage::engine::{self, Engine, TEMP_DIR};
-    use storage::mvcc::tests::*;
-    use storage::mvcc::WriteType;
-    use storage::mvcc::{MvccReader, MvccTxn};
-    use storage::{Key, Mutation, Options, ScanMode, ALL_CFS, SHORT_VALUE_MAX_LEN};
+    use crate::storage::kv::Engine;
+    use crate::storage::mvcc::tests::*;
+    use crate::storage::mvcc::WriteType;
+    use crate::storage::mvcc::{MvccReader, MvccTxn};
+    use crate::storage::{
+        Key, Mutation, Options, ScanMode, TestEngineBuilder, SHORT_VALUE_MAX_LEN,
+    };
 
     fn test_mvcc_txn_read_imp(k: &[u8], v: &[u8]) {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         must_get_none(&engine, k, 1);
 
@@ -417,7 +418,7 @@ mod tests {
     }
 
     fn test_mvcc_txn_prewrite_imp(k: &[u8], v: &[u8]) {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         must_prewrite_put(&engine, k, v, k, 5);
         // Key is locked.
@@ -447,8 +448,45 @@ mod tests {
     }
 
     #[test]
+    fn test_mvcc_txn_prewrite_insert() {
+        let engine = TestEngineBuilder::new().build().unwrap();
+        let (k1, v1, v2, v3) = (b"k1", b"v1", b"v2", b"v3");
+        must_prewrite_put(&engine, k1, v1, k1, 1);
+        must_commit(&engine, k1, 1, 2);
+
+        // "k1" already exist, returns AlreadyExist error.
+        assert!(try_prewrite_insert(&engine, k1, v2, k1, 3).is_err());
+
+        // Delete "k1"
+        must_prewrite_delete(&engine, k1, k1, 4);
+        must_commit(&engine, k1, 4, 5);
+
+        // After delete "k1", insert returns ok.
+        assert!(try_prewrite_insert(&engine, k1, v2, k1, 6).is_ok());
+        must_commit(&engine, k1, 6, 7);
+
+        // Rollback
+        must_prewrite_put(&engine, k1, v3, k1, 8);
+        must_rollback(&engine, k1, 8);
+
+        assert!(try_prewrite_insert(&engine, k1, v3, k1, 9).is_err());
+
+        // Delete "k1" again
+        must_prewrite_delete(&engine, k1, k1, 10);
+        must_commit(&engine, k1, 10, 11);
+
+        // Rollback again
+        must_prewrite_put(&engine, k1, v3, k1, 12);
+        must_rollback(&engine, k1, 12);
+
+        // After delete "k1", insert returns ok.
+        assert!(try_prewrite_insert(&engine, k1, v2, k1, 13).is_ok());
+        must_commit(&engine, k1, 13, 14);
+    }
+
+    #[test]
     fn test_rollback_lock() {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         let (k, v) = (b"k1", b"v1");
         must_prewrite_put(&engine, k, v, k, 5);
@@ -464,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_rollback_del() {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         let (k, v) = (b"k1", b"v1");
         must_prewrite_put(&engine, k, v, k, 5);
@@ -487,7 +525,7 @@ mod tests {
     }
 
     fn test_mvcc_txn_commit_ok_imp(k1: &[u8], v1: &[u8], k2: &[u8], k3: &[u8]) {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
         must_prewrite_put(&engine, k1, v1, k1, 10);
         must_prewrite_lock(&engine, k2, k1, 10);
         must_prewrite_delete(&engine, k3, k1, 10);
@@ -515,7 +553,7 @@ mod tests {
     }
 
     fn test_mvcc_txn_commit_err_imp(k: &[u8], v: &[u8]) {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         // Not prewrite yet
         must_commit_err(&engine, k, 1, 2);
@@ -536,7 +574,7 @@ mod tests {
     }
 
     fn test_mvcc_txn_rollback_imp(k: &[u8], v: &[u8]) {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         must_prewrite_put(&engine, k, v, k, 5);
         must_rollback(&engine, k, 5);
@@ -552,7 +590,7 @@ mod tests {
 
     #[test]
     fn test_mvcc_txn_rollback_after_commit() {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         let k = b"k";
         let v = b"v";
@@ -583,7 +621,7 @@ mod tests {
     }
 
     fn test_mvcc_txn_rollback_err_imp(k: &[u8], v: &[u8]) {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         must_prewrite_put(&engine, k, v, k, 5);
         must_commit(&engine, k, 5, 10);
@@ -601,14 +639,14 @@ mod tests {
 
     #[test]
     fn test_mvcc_txn_rollback_before_prewrite() {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
         let key = b"key";
         must_rollback(&engine, key, 5);
         must_prewrite_lock_err(&engine, key, key, 5);
     }
 
     fn test_gc_imp(k: &[u8], v1: &[u8], v2: &[u8], v3: &[u8], v4: &[u8]) {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         must_prewrite_put(&engine, k, v1, k, 5);
         must_commit(&engine, k, 5, 10);
@@ -675,7 +713,7 @@ mod tests {
     }
 
     fn test_write_imp(k: &[u8], v: &[u8], k2: &[u8], k3: &[u8]) {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         must_prewrite_put(&engine, k, v, k, 5);
         must_seek_write_none(&engine, k, 5);
@@ -710,7 +748,7 @@ mod tests {
     }
 
     fn test_scan_keys_imp(keys: Vec<&[u8]>, values: Vec<&[u8]>) {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
         must_prewrite_put(&engine, keys[0], values[0], keys[0], 1);
         must_commit(&engine, keys[0], 1, 10);
         must_prewrite_lock(&engine, keys[1], keys[1], 1);
@@ -737,7 +775,7 @@ mod tests {
     }
 
     fn test_write_size_imp(k: &[u8], v: &[u8], pk: &[u8]) {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
         let ctx = Context::new();
         let snapshot = engine.snapshot(&ctx).unwrap();
         let mut txn = MvccTxn::new(snapshot, 10, true).unwrap();
@@ -748,13 +786,14 @@ mod tests {
             Mutation::Put((key.clone(), v.to_vec())),
             pk,
             &Options::default(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(txn.write_size() > 0);
         engine.write(&ctx, txn.into_modifies()).unwrap();
 
         let snapshot = engine.snapshot(&ctx).unwrap();
         let mut txn = MvccTxn::new(snapshot, 10, true).unwrap();
-        txn.commit(&key, 15).unwrap();
+        txn.commit(key, 15).unwrap();
         assert!(txn.write_size() > 0);
         engine.write(&ctx, txn.into_modifies()).unwrap();
     }
@@ -769,7 +808,7 @@ mod tests {
 
     #[test]
     fn test_skip_constraint_check() {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
         let (key, value) = (b"key", b"value");
 
         must_prewrite_put(&engine, key, value, key, 5);
@@ -778,31 +817,31 @@ mod tests {
         let ctx = Context::new();
         let snapshot = engine.snapshot(&ctx).unwrap();
         let mut txn = MvccTxn::new(snapshot, 5, true).unwrap();
-        assert!(
-            txn.prewrite(
+        assert!(txn
+            .prewrite(
                 Mutation::Put((Key::from_raw(key), value.to_vec())),
                 key,
                 &Options::default()
-            ).is_err()
-        );
+            )
+            .is_err());
 
         let ctx = Context::new();
         let snapshot = engine.snapshot(&ctx).unwrap();
         let mut txn = MvccTxn::new(snapshot, 5, true).unwrap();
         let mut opt = Options::default();
         opt.skip_constraint_check = true;
-        assert!(
-            txn.prewrite(
+        assert!(txn
+            .prewrite(
                 Mutation::Put((Key::from_raw(key), value.to_vec())),
                 key,
                 &opt
-            ).is_ok()
-        );
+            )
+            .is_ok());
     }
 
     #[test]
     fn test_read_commit() {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
         let (key, v1, v2) = (b"key", b"v1", b"v2");
 
         must_prewrite_put(&engine, key, v1, key, 5);
@@ -815,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_collapse_prev_rollback() {
-        let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
         let (key, value) = (b"key", b"value");
 
         // Add a Rollback whose start ts is 1.
@@ -841,9 +880,7 @@ mod tests {
 
     #[test]
     fn test_scan_values_in_default() {
-        let path = TempDir::new("_test_scan_values_in_default").expect("");
-        let path = path.path().to_str().unwrap();
-        let engine = engine::new_local_engine(path, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         must_prewrite_put(
             &engine,
@@ -899,9 +936,7 @@ mod tests {
 
     #[test]
     fn test_seek_ts() {
-        let path = TempDir::new("_test_seek_ts").expect("");
-        let path = path.path().to_str().unwrap();
-        let engine = engine::new_local_engine(path, ALL_CFS).unwrap();
+        let engine = TestEngineBuilder::new().build().unwrap();
 
         must_prewrite_put(&engine, &[2], b"vv", &[2], 3);
         must_commit(&engine, &[2], 3, 3);

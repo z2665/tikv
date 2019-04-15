@@ -1,27 +1,20 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
+
+use std::io::Write;
+
+use cop_datatype::prelude::*;
+use cop_datatype::{FieldTypeFlag, FieldTypeTp};
 
 use super::{Error, Result};
-use coprocessor::codec::mysql::decimal::DECIMAL_STRUCT_SIZE;
-use coprocessor::codec::mysql::{
-    types, Decimal, DecimalEncoder, Duration, DurationEncoder, Json, JsonEncoder, Time, TimeEncoder,
+use crate::coprocessor::codec::mysql::decimal::DECIMAL_STRUCT_SIZE;
+use crate::coprocessor::codec::mysql::{
+    Decimal, DecimalEncoder, Duration, DurationEncoder, Json, JsonEncoder, Time, TimeEncoder,
 };
-use coprocessor::codec::Datum;
-use std::io::Write;
-use tipb::expression::FieldType;
-use util::codec::number::{self, NumberEncoder};
+use crate::coprocessor::codec::Datum;
+
+use tikv_util::codec::number::{self, NumberEncoder};
 #[cfg(test)]
-use util::codec::BytesSlice;
+use tikv_util::codec::BytesSlice;
 
 /// `Column` stores the same column data of multi rows in one chunk.
 #[derive(Default)]
@@ -37,63 +30,66 @@ pub struct Column {
 
 impl Column {
     /// Create the column with a specified type and capacity.
-    pub fn new(tp: &FieldType, init_cap: usize) -> Column {
-        match tp.get_tp() as u8 {
-            types::TINY
-            | types::SHORT
-            | types::INT24
-            | types::LONG
-            | types::LONG_LONG
-            | types::YEAR
-            | types::FLOAT
-            | types::DOUBLE => {
+    pub fn new(field_type: &dyn FieldTypeAccessor, init_cap: usize) -> Column {
+        match field_type.tp() {
+            FieldTypeTp::Tiny
+            | FieldTypeTp::Short
+            | FieldTypeTp::Int24
+            | FieldTypeTp::Long
+            | FieldTypeTp::LongLong
+            | FieldTypeTp::Year
+            | FieldTypeTp::Float
+            | FieldTypeTp::Double => {
                 //TODO:no Datum::F32
                 Column::new_fixed_len(8, init_cap)
             }
-            types::DURATION | types::DATE | types::DATETIME | types::TIMESTAMP => {
-                Column::new_fixed_len(16, init_cap)
-            }
-            types::NEW_DECIMAL => Column::new_fixed_len(DECIMAL_STRUCT_SIZE, init_cap),
+            FieldTypeTp::Duration
+            | FieldTypeTp::Date
+            | FieldTypeTp::DateTime
+            | FieldTypeTp::Timestamp => Column::new_fixed_len(16, init_cap),
+            FieldTypeTp::NewDecimal => Column::new_fixed_len(DECIMAL_STRUCT_SIZE, init_cap),
             _ => Column::new_var_len_column(init_cap),
         }
     }
 
     /// Get the datum of one row with the specified type.
-    pub fn get_datum(&self, idx: usize, tp: &FieldType) -> Result<Datum> {
+    pub fn get_datum(&self, idx: usize, field_type: &dyn FieldTypeAccessor) -> Result<Datum> {
         if self.is_null(idx) {
             return Ok(Datum::Null);
         }
-        let d = match tp.get_tp() as u8 {
-            types::TINY
-            | types::SHORT
-            | types::INT24
-            | types::LONG
-            | types::LONG_LONG
-            | types::YEAR => {
-                if types::has_unsigned_flag(tp.get_flag()) {
+        let d = match field_type.tp() {
+            FieldTypeTp::Tiny
+            | FieldTypeTp::Short
+            | FieldTypeTp::Int24
+            | FieldTypeTp::Long
+            | FieldTypeTp::LongLong
+            | FieldTypeTp::Year => {
+                if field_type.flag().contains(FieldTypeFlag::UNSIGNED) {
                     Datum::U64(self.get_u64(idx)?)
                 } else {
                     Datum::I64(self.get_i64(idx)?)
                 }
             }
-            types::FLOAT | types::DOUBLE => Datum::F64(self.get_f64(idx)?),
-            types::DATE | types::DATETIME | types::TIMESTAMP => Datum::Time(self.get_time(idx)?),
-            types::DURATION => Datum::Dur(self.get_duration(idx)?),
-            types::NEW_DECIMAL => Datum::Dec(self.get_decimal(idx)?),
-            types::JSON => Datum::Json(self.get_json(idx)?),
-            types::ENUM | types::BIT | types::SET => {
-                return Err(box_err!(
-                    "get datum with {:?} is not supported yet.",
-                    tp.get_tp()
-                ))
+            FieldTypeTp::Float | FieldTypeTp::Double => Datum::F64(self.get_f64(idx)?),
+            FieldTypeTp::Date | FieldTypeTp::DateTime | FieldTypeTp::Timestamp => {
+                Datum::Time(self.get_time(idx)?)
             }
-            types::VARCHAR
-            | types::VAR_STRING
-            | types::STRING
-            | types::BLOB
-            | types::TINY_BLOB
-            | types::MEDIUM_BLOB
-            | types::LONG_BLOB => Datum::Bytes(self.get_bytes(idx).to_vec()),
+            FieldTypeTp::Duration => Datum::Dur(self.get_duration(idx)?),
+            FieldTypeTp::NewDecimal => Datum::Dec(self.get_decimal(idx)?),
+            FieldTypeTp::JSON => Datum::Json(self.get_json(idx)?),
+            FieldTypeTp::Enum | FieldTypeTp::Bit | FieldTypeTp::Set => {
+                return Err(box_err!(
+                    "get datum with {} is not supported yet.",
+                    field_type.tp()
+                ));
+            }
+            FieldTypeTp::VarChar
+            | FieldTypeTp::VarString
+            | FieldTypeTp::String
+            | FieldTypeTp::Blob
+            | FieldTypeTp::TinyBlob
+            | FieldTypeTp::MediumBlob
+            | FieldTypeTp::LongBlob => Datum::Bytes(self.get_bytes(idx).to_vec()),
             _ => unreachable!(),
         };
         Ok(d)
@@ -331,8 +327,8 @@ impl Column {
     }
 
     #[cfg(test)]
-    pub fn decode(buf: &mut BytesSlice, tp: &FieldType) -> Result<Column> {
-        use util::codec::read_slice;
+    pub fn decode(buf: &mut BytesSlice<'_>, tp: &dyn FieldTypeAccessor) -> Result<Column> {
+        use tikv_util::codec::read_slice;
         let length = number::decode_u32_le(buf)? as usize;
         let mut col = Column::new(tp, length);
         col.length = length;
@@ -348,7 +344,7 @@ impl Column {
             col.fixed_len * col.length
         } else {
             col.var_offsets.clear();
-            for _ in 0..length + 1 {
+            for _ in 0..=length {
                 col.var_offsets.push(number::decode_i32_le(buf)? as usize);
             }
             col.var_offsets[col.length]
@@ -386,23 +382,23 @@ pub trait ColumnEncoder: NumberEncoder {
 impl<T: Write> ColumnEncoder for T {}
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use coprocessor::codec::chunk::test::field_type;
-    use coprocessor::codec::datum::Datum;
-    use coprocessor::codec::mysql::*;
+    use crate::coprocessor::codec::chunk::tests::field_type;
+    use crate::coprocessor::codec::datum::Datum;
+    use crate::coprocessor::codec::mysql::*;
     use std::{f64, u64};
     use tipb::expression::FieldType;
 
     #[test]
     fn test_column_i64() {
         let fields = vec![
-            field_type(types::TINY),
-            field_type(types::SHORT),
-            field_type(types::INT24),
-            field_type(types::LONG),
-            field_type(types::LONG_LONG),
-            field_type(types::YEAR),
+            field_type(FieldTypeTp::Tiny),
+            field_type(FieldTypeTp::Short),
+            field_type(FieldTypeTp::Int24),
+            field_type(FieldTypeTp::Long),
+            field_type(FieldTypeTp::LongLong),
+            field_type(FieldTypeTp::Year),
         ];
         let data = vec![
             Datum::Null,
@@ -426,15 +422,15 @@ mod test {
     #[test]
     fn test_column_u64() {
         let mut fields = vec![
-            field_type(types::TINY),
-            field_type(types::SHORT),
-            field_type(types::INT24),
-            field_type(types::LONG),
-            field_type(types::LONG_LONG),
-            field_type(types::YEAR),
+            field_type(FieldTypeTp::Tiny),
+            field_type(FieldTypeTp::Short),
+            field_type(FieldTypeTp::Int24),
+            field_type(FieldTypeTp::Long),
+            field_type(FieldTypeTp::LongLong),
+            field_type(FieldTypeTp::Year),
         ];
         for field in &mut fields {
-            field.set_flag(types::UNSIGNED_FLAG as u32);
+            field.set_flag(FieldTypeFlag::UNSIGNED.bits());
         }
         let data = vec![
             Datum::Null,
@@ -460,7 +456,10 @@ mod test {
 
     #[test]
     fn test_column_f64() {
-        let fields = vec![field_type(types::FLOAT), field_type(types::DOUBLE)];
+        let fields = vec![
+            field_type(FieldTypeTp::Float),
+            field_type(FieldTypeTp::Double),
+        ];
         let data = vec![Datum::Null, Datum::F64(f64::MIN), Datum::F64(f64::MAX)];
         test_colum_datum(fields, data);
     }
@@ -468,9 +467,9 @@ mod test {
     #[test]
     fn test_column_time() {
         let fields = vec![
-            field_type(types::DATE),
-            field_type(types::DATETIME),
-            field_type(types::TIMESTAMP),
+            field_type(FieldTypeTp::Date),
+            field_type(FieldTypeTp::DateTime),
+            field_type(FieldTypeTp::Timestamp),
         ];
         let time = Time::parse_utc_datetime("2012-12-31 11:30:45", -1).unwrap();
         let data = vec![Datum::Null, Datum::Time(time)];
@@ -479,7 +478,7 @@ mod test {
 
     #[test]
     fn test_column_duration() {
-        let fields = vec![field_type(types::DURATION)];
+        let fields = vec![field_type(FieldTypeTp::Duration)];
         let duration = Duration::parse(b"10:11:12", 0).unwrap();
         let data = vec![Datum::Null, Datum::Dur(duration)];
         test_colum_datum(fields, data);
@@ -487,7 +486,7 @@ mod test {
 
     #[test]
     fn test_column_decimal() {
-        let fields = vec![field_type(types::NEW_DECIMAL)];
+        let fields = vec![field_type(FieldTypeTp::NewDecimal)];
         let dec: Decimal = "1234.00".parse().unwrap();
         let data = vec![Datum::Null, Datum::Dec(dec)];
         test_colum_datum(fields, data);
@@ -495,7 +494,7 @@ mod test {
 
     #[test]
     fn test_column_json() {
-        let fields = vec![field_type(types::JSON)];
+        let fields = vec![field_type(FieldTypeTp::JSON)];
         let json: Json = r#"{"k1":"v1"}"#.parse().unwrap();
 
         let data = vec![Datum::Null, Datum::Json(json)];
@@ -505,13 +504,13 @@ mod test {
     #[test]
     fn test_column_bytes() {
         let fields = vec![
-            field_type(types::VARCHAR),
-            field_type(types::VAR_STRING),
-            field_type(types::STRING),
-            field_type(types::BLOB),
-            field_type(types::TINY_BLOB),
-            field_type(types::MEDIUM_BLOB),
-            field_type(types::LONG_BLOB),
+            field_type(FieldTypeTp::VarChar),
+            field_type(FieldTypeTp::VarString),
+            field_type(FieldTypeTp::String),
+            field_type(FieldTypeTp::Blob),
+            field_type(FieldTypeTp::TinyBlob),
+            field_type(FieldTypeTp::MediumBlob),
+            field_type(FieldTypeTp::LongBlob),
         ];
         let data = vec![Datum::Null, Datum::Bytes(b"xxx".to_vec())];
         test_colum_datum(fields, data);

@@ -1,23 +1,11 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::time::Duration;
 use std::u64;
-
 use time::Duration as TimeDuration;
 
-use raftstore::{coprocessor, Result};
-use util::config::{ReadableDuration, ReadableSize};
+use crate::raftstore::{coprocessor, Result};
+use tikv_util::config::{ReadableDuration, ReadableSize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -52,6 +40,10 @@ pub struct Config {
     // When the approximate size of raft log entries exceed this value,
     // gc will be forced trigger.
     pub raft_log_gc_size_limit: ReadableSize,
+    // When a peer is not responding for this time, leader will not keep entry cache for it.
+    pub raft_entry_cache_life_time: ReadableDuration,
+    // When a peer is newly added, reject transferring leader to the peer for a while.
+    pub raft_reject_transfer_leader_duration: ReadableDuration,
 
     // Interval (ms) to check region whether need to be split or not.
     pub split_region_check_tick_interval: ReadableDuration,
@@ -92,6 +84,8 @@ pub struct Config {
     pub abnormal_leader_missing_duration: ReadableDuration,
     pub peer_stale_state_check_interval: ReadableDuration,
 
+    pub leader_transfer_max_log_lag: u64,
+
     pub snap_apply_batch_size: ReadableSize,
 
     // Interval (ms) to check region whether the data is consistent.
@@ -109,7 +103,7 @@ pub struct Config {
 
     /// Max log gap allowed to propose merge.
     pub merge_max_log_gap: u64,
-    /// Interval to repropose merge.
+    /// Interval to re-propose merge.
     pub merge_check_tick_interval: ReadableDuration,
 
     pub use_delete_range: bool,
@@ -118,6 +112,13 @@ pub struct Config {
 
     /// Maximum size of every local read task batch.
     pub local_read_batch_size: u64,
+
+    pub apply_max_batch_size: usize,
+    pub apply_pool_size: usize,
+
+    pub store_max_batch_size: usize,
+    pub store_pool_size: usize,
+    pub future_poll_size: usize,
 
     // Deprecated! These two configuration has been moved to Coprocessor.
     // They are preserved for compatibility check.
@@ -150,6 +151,8 @@ impl Default for Config {
             // Assume the average size of entries is 1k.
             raft_log_gc_count_limit: split_size * 3 / 4 / ReadableSize::kb(1),
             raft_log_gc_size_limit: split_size * 3 / 4,
+            raft_entry_cache_life_time: ReadableDuration::secs(30),
+            raft_reject_transfer_leader_duration: ReadableDuration::secs(3),
             split_region_check_tick_interval: ReadableDuration::secs(10),
             region_split_check_diff: split_size / 16,
             clean_stale_peer_delay: ReadableDuration::minutes(10),
@@ -167,6 +170,7 @@ impl Default for Config {
             max_leader_missing_duration: ReadableDuration::hours(2),
             abnormal_leader_missing_duration: ReadableDuration::minutes(10),
             peer_stale_state_check_interval: ReadableDuration::minutes(5),
+            leader_transfer_max_log_lag: 10,
             snap_apply_batch_size: ReadableSize::mb(10),
             lock_cf_compact_interval: ReadableDuration::minutes(10),
             lock_cf_compact_bytes_threshold: ReadableSize::mb(256),
@@ -182,6 +186,11 @@ impl Default for Config {
             use_delete_range: false,
             cleanup_import_sst_interval: ReadableDuration::minutes(10),
             local_read_batch_size: 1024,
+            apply_max_batch_size: 1024,
+            apply_pool_size: 2,
+            store_max_batch_size: 1024,
+            store_pool_size: 2,
+            future_poll_size: 1,
 
             // They are preserved for compatibility check.
             region_max_size: ReadableSize(0),
@@ -283,6 +292,12 @@ impl Config {
             ));
         }
 
+        if self.leader_transfer_max_log_lag < 10 {
+            return Err(box_err!(
+                "raftstore.leader-transfer-max-log-lag should be >= 10."
+            ));
+        }
+
         let abnormal_leader_missing = self.abnormal_leader_missing_duration.as_millis() as u64;
         if abnormal_leader_missing < stale_state_check {
             return Err(box_err!(
@@ -313,15 +328,206 @@ impl Config {
         if self.local_read_batch_size == 0 {
             return Err(box_err!("local-read-batch-size must be greater than 0"));
         }
+
+        if self.apply_pool_size == 0 {
+            return Err(box_err!("apply-pool-size should be greater than 0"));
+        }
+        if self.apply_max_batch_size == 0 {
+            return Err(box_err!("apply-max-batch-size should be greater than 0"));
+        }
+        if self.store_pool_size == 0 {
+            return Err(box_err!("store-pool-size should be greater than 0"));
+        }
+        if self.store_max_batch_size == 0 {
+            return Err(box_err!("store-max-batch-size should be greater than 0"));
+        }
+        if self.future_poll_size == 0 {
+            return Err(box_err!("future-poll-size should be greater than 0."));
+        }
         Ok(())
+    }
+
+    pub fn write_into_metrics(&self) {
+        let metrics = register_gauge_vec!(
+            "tikv_config_raftstore",
+            "Config information of raftstore",
+            &["name"]
+        )
+        .unwrap();
+        metrics
+            .with_label_values(&["sync_log"])
+            .set((self.sync_log as i32).into());
+        metrics
+            .with_label_values(&["prevote"])
+            .set((self.prevote as i32).into());
+
+        metrics
+            .with_label_values(&["capacity"])
+            .set(self.capacity.0 as f64);
+        metrics
+            .with_label_values(&["raft_base_tick_interval"])
+            .set(self.raft_base_tick_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["raft_heartbeat_ticks"])
+            .set(self.raft_heartbeat_ticks as f64);
+        metrics
+            .with_label_values(&["raft_election_timeout_ticks"])
+            .set(self.raft_election_timeout_ticks as f64);
+        metrics
+            .with_label_values(&["raft_min_election_timeout_ticks"])
+            .set(self.raft_min_election_timeout_ticks as f64);
+        metrics
+            .with_label_values(&["raft_max_election_timeout_ticks"])
+            .set(self.raft_max_election_timeout_ticks as f64);
+        metrics
+            .with_label_values(&["raft_max_size_per_msg"])
+            .set(self.raft_max_size_per_msg.0 as f64);
+        metrics
+            .with_label_values(&["raft_max_inflight_msgs"])
+            .set(self.raft_max_inflight_msgs as f64);
+        metrics
+            .with_label_values(&["raft_entry_max_size"])
+            .set(self.raft_entry_max_size.0 as f64);
+
+        metrics
+            .with_label_values(&["raft_log_gc_tick_interval"])
+            .set(self.raft_log_gc_tick_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["raft_log_gc_threshold"])
+            .set(self.raft_log_gc_threshold as f64);
+        metrics
+            .with_label_values(&["raft_log_gc_count_limit"])
+            .set(self.raft_log_gc_count_limit as f64);
+        metrics
+            .with_label_values(&["raft_log_gc_size_limit"])
+            .set(self.raft_log_gc_size_limit.0 as f64);
+        metrics
+            .with_label_values(&["raft_entry_cache_life_time"])
+            .set(self.raft_entry_cache_life_time.as_secs() as f64);
+        metrics
+            .with_label_values(&["raft_reject_transfer_leader_duration"])
+            .set(self.raft_reject_transfer_leader_duration.as_secs() as f64);
+
+        metrics
+            .with_label_values(&["split_region_check_tick_interval"])
+            .set(self.split_region_check_tick_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["region_split_check_diff"])
+            .set(self.region_split_check_diff.0 as f64);
+        metrics
+            .with_label_values(&["region_compact_check_interval"])
+            .set(self.region_compact_check_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["clean_stale_peer_delay"])
+            .set(self.clean_stale_peer_delay.as_secs() as f64);
+        metrics
+            .with_label_values(&["region_compact_check_step"])
+            .set(self.region_compact_check_step as f64);
+        metrics
+            .with_label_values(&["region_compact_min_tombstones"])
+            .set(self.region_compact_min_tombstones as f64);
+        metrics
+            .with_label_values(&["region_compact_tombstones_percent"])
+            .set(self.region_compact_tombstones_percent as f64);
+        metrics
+            .with_label_values(&["pd_heartbeat_tick_interval"])
+            .set(self.pd_heartbeat_tick_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["pd_store_heartbeat_tick_interval"])
+            .set(self.pd_store_heartbeat_tick_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["snap_mgr_gc_tick_interval"])
+            .set(self.snap_mgr_gc_tick_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["snap_gc_timeout"])
+            .set(self.snap_gc_timeout.as_secs() as f64);
+        metrics
+            .with_label_values(&["lock_cf_compact_interval"])
+            .set(self.lock_cf_compact_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["lock_cf_compact_bytes_threshold"])
+            .set(self.lock_cf_compact_bytes_threshold.0 as f64);
+
+        metrics
+            .with_label_values(&["notify_capacity"])
+            .set(self.notify_capacity as f64);
+        metrics
+            .with_label_values(&["messages_per_tick"])
+            .set(self.messages_per_tick as f64);
+
+        metrics
+            .with_label_values(&["max_peer_down_duration"])
+            .set(self.max_peer_down_duration.as_secs() as f64);
+        metrics
+            .with_label_values(&["max_leader_missing_duration"])
+            .set(self.max_leader_missing_duration.as_secs() as f64);
+        metrics
+            .with_label_values(&["abnormal_leader_missing_duration"])
+            .set(self.abnormal_leader_missing_duration.as_secs() as f64);
+        metrics
+            .with_label_values(&["peer_stale_state_check_interval"])
+            .set(self.peer_stale_state_check_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["leader_transfer_max_log_lag"])
+            .set(self.leader_transfer_max_log_lag as f64);
+
+        metrics
+            .with_label_values(&["snap_apply_batch_size"])
+            .set(self.snap_apply_batch_size.0 as f64);
+
+        metrics
+            .with_label_values(&["consistency_check_interval_seconds"])
+            .set(self.consistency_check_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["report_region_flow_interval"])
+            .set(self.report_region_flow_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["raft_store_max_leader_lease"])
+            .set(self.raft_store_max_leader_lease.as_secs() as f64);
+        metrics
+            .with_label_values(&["right_derive_when_split"])
+            .set((self.right_derive_when_split as i32).into());
+        metrics
+            .with_label_values(&["allow_remove_leader"])
+            .set((self.allow_remove_leader as i32).into());
+
+        metrics
+            .with_label_values(&["merge_max_log_gap"])
+            .set(self.merge_max_log_gap as f64);
+        metrics
+            .with_label_values(&["merge_check_tick_interval"])
+            .set(self.merge_check_tick_interval.as_secs() as f64);
+        metrics
+            .with_label_values(&["use_delete_range"])
+            .set((self.use_delete_range as i32).into());
+        metrics
+            .with_label_values(&["cleanup_import_sst_interval"])
+            .set(self.cleanup_import_sst_interval.as_secs() as f64);
+
+        metrics
+            .with_label_values(&["local_read_batch_size"])
+            .set(self.local_read_batch_size as f64);
+        metrics
+            .with_label_values(&["apply_max_batch_size"])
+            .set(self.apply_max_batch_size as f64);
+        metrics
+            .with_label_values(&["apply_pool_size"])
+            .set(self.apply_pool_size as f64);
+        metrics
+            .with_label_values(&["store_max_batch_size"])
+            .set(self.store_max_batch_size as f64);
+        metrics
+            .with_label_values(&["store_pool_size"])
+            .set(self.store_pool_size as f64);
+        metrics
+            .with_label_values(&["future_poll_size"])
+            .set(self.future_poll_size as f64);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use util::config::*;
 
     #[test]
     fn test_config_validate() {
@@ -396,6 +602,18 @@ mod tests {
 
         cfg = Config::new();
         cfg.local_read_batch_size = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg = Config::new();
+        cfg.apply_max_batch_size = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg = Config::new();
+        cfg.apply_pool_size = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg = Config::new();
+        cfg.future_poll_size = 0;
         assert!(cfg.validate().is_err());
     }
 }

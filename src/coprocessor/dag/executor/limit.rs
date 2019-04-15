@@ -1,35 +1,22 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// remove later
-#![allow(dead_code)]
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use tipb::executor::Limit;
 
 use super::ExecutorMetrics;
-use coprocessor::dag::executor::{Executor, Row};
-use coprocessor::dag::expr::EvalWarnings;
-use coprocessor::Result;
+use crate::coprocessor::dag::executor::{Executor, Row};
+use crate::coprocessor::dag::expr::EvalWarnings;
+use crate::coprocessor::Result;
 
+/// Retrieves rows from the source executor and only produces part of the rows.
 pub struct LimitExecutor<'a> {
     limit: u64,
     cursor: u64,
-    src: Box<Executor + Send + 'a>,
+    src: Box<dyn Executor + Send + 'a>,
     first_collect: bool,
 }
 
 impl<'a> LimitExecutor<'a> {
-    pub fn new(limit: Limit, src: Box<Executor + Send + 'a>) -> LimitExecutor {
+    pub fn new(limit: Limit, src: Box<dyn Executor + Send + 'a>) -> LimitExecutor<'_> {
         LimitExecutor {
             limit: limit.get_limit(),
             cursor: 0,
@@ -74,18 +61,11 @@ impl<'a> Executor for LimitExecutor<'a> {
 }
 
 #[cfg(test)]
-mod test {
-    use kvproto::kvrpcpb::IsolationLevel;
-    use protobuf::RepeatedField;
-    use tipb::executor::TableScan;
+mod tests {
+    use crate::coprocessor::codec::datum::Datum;
+    use cop_datatype::FieldTypeTp;
 
-    use coprocessor::codec::datum::Datum;
-    use coprocessor::codec::mysql::types;
-    use storage::SnapshotStore;
-
-    use super::super::scanner::test::{get_range, new_col_info, TestStore};
-    use super::super::table_scan::TableScanExecutor;
-    use super::super::topn::test::gen_table_data;
+    use super::super::tests::*;
     use super::*;
 
     #[test]
@@ -93,8 +73,8 @@ mod test {
         // prepare data and store
         let tid = 1;
         let cis = vec![
-            new_col_info(1, types::LONG_LONG),
-            new_col_info(2, types::VARCHAR),
+            new_col_info(1, FieldTypeTp::LongLong),
+            new_col_info(2, FieldTypeTp::VarChar),
         ];
         let raw_data = vec![
             vec![Datum::I64(1), Datum::Bytes(b"a".to_vec())],
@@ -105,27 +85,18 @@ mod test {
             vec![Datum::I64(6), Datum::Bytes(b"f".to_vec())],
             vec![Datum::I64(7), Datum::Bytes(b"g".to_vec())],
         ];
-        let table_data = gen_table_data(tid, &cis, &raw_data);
-        let mut test_store = TestStore::new(&table_data);
-        // init table scan meta
-        let mut table_scan = TableScan::new();
-        table_scan.set_table_id(tid);
-        table_scan.set_columns(RepeatedField::from_vec(cis.clone()));
         // prepare range
         let range1 = get_range(tid, 0, 4);
         let range2 = get_range(tid, 5, 10);
         let key_ranges = vec![range1, range2];
-        // init TableScan
-        let (snapshot, start_ts) = test_store.get_snapshot();
-        let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
-        let ts_ect = TableScanExecutor::new(table_scan, key_ranges, store, false).unwrap();
+        let ts_ect = gen_table_scan_executor(tid, cis, &raw_data, Some(key_ranges));
 
         // init Limit meta
         let mut limit_meta = Limit::default();
         let limit = 5;
         limit_meta.set_limit(limit);
         // init topn executor
-        let mut limit_ect = LimitExecutor::new(limit_meta, Box::new(ts_ect));
+        let mut limit_ect = LimitExecutor::new(limit_meta, ts_ect);
         let mut limit_rows = Vec::with_capacity(limit as usize);
         while let Some(row) = limit_ect.next().unwrap() {
             limit_rows.push(row.take_origin());

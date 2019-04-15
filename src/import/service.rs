@@ -1,18 +1,7 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
+use crate::grpc::{RpcContext, RpcStatus, RpcStatusCode, UnarySink};
 use futures::Future;
-use grpc::{RpcContext, RpcStatus, RpcStatusCode, UnarySink};
 
 use super::Error;
 
@@ -20,13 +9,13 @@ pub fn make_rpc_error(err: Error) -> RpcStatus {
     RpcStatus::new(RpcStatusCode::Unknown, Some(format!("{:?}", err)))
 }
 
-pub fn send_rpc_error<M, E>(ctx: RpcContext, sink: UnarySink<M>, error: E)
+pub fn send_rpc_error<M, E>(ctx: RpcContext<'_>, sink: UnarySink<M>, error: E)
 where
     Error: From<E>,
 {
     let err = make_rpc_error(Error::from(error));
     ctx.spawn(sink.fail(err).map_err(|e| {
-        warn!("send rpc error: {:?}", e);
+        warn!("send rpc failed"; "err" => %e);
     }));
 }
 
@@ -46,6 +35,6 @@ macro_rules! send_rpc_response {
                 $sink.fail(make_rpc_error(e))
             }
         };
-        res.map_err(|e| warn!("send rpc response: {:?}", e))
+        res.map_err(|e| warn!("send rpc response"; "err" => %e))
     }};
 }

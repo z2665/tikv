@@ -1,15 +1,4 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use byteorder::{ByteOrder, LittleEndian};
 use murmur3::murmur3_x64_128;
@@ -74,14 +63,14 @@ impl CMSketch {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use coprocessor::codec::datum;
-    use coprocessor::codec::datum::Datum;
+    use crate::coprocessor::codec::datum;
+    use crate::coprocessor::codec::datum::Datum;
     use rand::{Rng, SeedableRng, StdRng};
     use std::cmp::min;
-    use util::as_slice;
-    use util::collections::HashMap;
+    use tikv_util::as_slice;
+    use tikv_util::collections::HashMap;
     use zipf::ZipfDistribution;
 
     impl CMSketch {

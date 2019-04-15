@@ -1,29 +1,18 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::borrow::Cow;
 use std::{self, i64, str, u64};
 
+use cop_datatype::{self, FieldTypeTp};
+
 use super::mysql::Res;
 use super::{Error, Result};
-use coprocessor::dag::expr::EvalContext;
-// `UNSPECIFIED_LENGTH` is unspecified length from FieldType
-pub const UNSPECIFIED_LENGTH: i32 = -1;
+use crate::coprocessor::dag::expr::EvalContext;
 
 /// `truncate_binary` truncates a buffer to the specified length.
 #[inline]
 pub fn truncate_binary(s: &mut Vec<u8>, flen: isize) {
-    if flen != UNSPECIFIED_LENGTH as isize && s.len() > flen as usize {
+    if flen != cop_datatype::UNSPECIFIED_LENGTH as isize && s.len() > flen as usize {
         s.truncate(flen as usize);
     }
 }
@@ -55,7 +44,6 @@ pub fn truncate_f64(mut f: f64, flen: u8, decimal: u8) -> Res<f64> {
 }
 
 /// `overflow` returns an overflowed error.
-#[macro_export]
 macro_rules! overflow {
     ($val:ident, $bound:ident) => {{
         Err(box_err!("constant {} overflows {}", $val, $bound))
@@ -64,7 +52,7 @@ macro_rules! overflow {
 
 /// `convert_uint_to_int` converts an uint value to an int value.
 #[inline]
-pub fn convert_uint_to_int(val: u64, upper_bound: i64, tp: u8) -> Result<i64> {
+pub fn convert_uint_to_int(val: u64, upper_bound: i64, tp: FieldTypeTp) -> Result<i64> {
     if val > upper_bound as u64 {
         return overflow!(val, tp);
     }
@@ -73,7 +61,12 @@ pub fn convert_uint_to_int(val: u64, upper_bound: i64, tp: u8) -> Result<i64> {
 
 /// `convert_float_to_int` converts an f64 value to an i64 value.
 ///  Returns the overflow error if the value exceeds the boundary.
-pub fn convert_float_to_int(fval: f64, lower_bound: i64, upper_bound: i64, tp: u8) -> Result<i64> {
+pub fn convert_float_to_int(
+    fval: f64,
+    lower_bound: i64,
+    upper_bound: i64,
+    tp: FieldTypeTp,
+) -> Result<i64> {
     // TODO any performance problem to use round directly?
     let val = fval.round();
     if val < lower_bound as f64 {
@@ -88,7 +81,7 @@ pub fn convert_float_to_int(fval: f64, lower_bound: i64, upper_bound: i64, tp: u
 
 /// `convert_float_to_uint` converts a f64 value to a u64 value.
 /// Returns the overflow error if the value exceeds the boundary.
-pub fn convert_float_to_uint(fval: f64, upper_bound: u64, tp: u8) -> Result<u64> {
+pub fn convert_float_to_uint(fval: f64, upper_bound: u64, tp: FieldTypeTp) -> Result<u64> {
     // TODO any performance problem to use round directly?
     let val = fval.round();
     if val < 0f64 {
@@ -180,12 +173,19 @@ fn bytes_to_f64_without_context(bytes: &[u8]) -> Result<f64> {
         Ok(s) => match s.trim().parse::<f64>() {
             Ok(f) => f,
             Err(e) => {
-                error!("failed to parse float from {}: {}", s, e);
+                error!(
+                    "failed to parse float";
+                    "from" => s,
+                    "err" => %e,
+                );
                 0.0
             }
         },
         Err(e) => {
-            error!("failed to convert bytes to str: {:?}", e);
+            error!(
+                "failed to convert bytes to str";
+                "err" => %e
+            );
             0.0
         }
     };
@@ -202,7 +202,7 @@ pub fn bytes_to_f64(ctx: &mut EvalContext, bytes: &[u8]) -> Result<f64> {
 
 fn get_valid_int_prefix<'a>(ctx: &mut EvalContext, s: &'a str) -> Result<Cow<'a, str>> {
     let vs = get_valid_float_prefix(ctx, s)?;
-    float_str_to_int_string(vs)
+    float_str_to_int_string(ctx, vs)
 }
 
 fn get_valid_float_prefix<'a>(ctx: &mut EvalContext, s: &'a str) -> Result<&'a str> {
@@ -254,7 +254,13 @@ fn get_valid_float_prefix<'a>(ctx: &mut EvalContext, s: &'a str) -> Result<&'a s
 /// It converts a valid float string into valid integer string which can be
 /// parsed by `i64::from_str`, we can't parse float first then convert it to string
 /// because precision will be lost.
-fn float_str_to_int_string<'a, 'b: 'a>(valid_float: &'b str) -> Result<Cow<'a, str>> {
+///
+/// When the float string indicating a value that is overflowing the i64,
+/// the original float string is returned and an overflow warning is attached
+fn float_str_to_int_string<'a, 'b: 'a>(
+    ctx: &mut EvalContext,
+    valid_float: &'b str,
+) -> Result<Cow<'a, str>> {
     let mut dot_idx = None;
     let mut e_idx = None;
     let mut int_cnt: i64 = 0;
@@ -264,12 +270,14 @@ fn float_str_to_int_string<'a, 'b: 'a>(valid_float: &'b str) -> Result<Cow<'a, s
         match c {
             '.' => dot_idx = Some(i),
             'e' | 'E' => e_idx = Some(i),
-            '0'...'9' => if e_idx.is_none() {
-                if dot_idx.is_none() {
-                    int_cnt += 1;
+            '0'..='9' => {
+                if e_idx.is_none() {
+                    if dot_idx.is_none() {
+                        int_cnt += 1;
+                    }
+                    digits_cnt += 1;
                 }
-                digits_cnt += 1;
-            },
+            }
             _ => (),
         }
     }
@@ -287,9 +295,10 @@ fn float_str_to_int_string<'a, 'b: 'a>(valid_float: &'b str) -> Result<Cow<'a, s
 
     let exp = box_try!((&valid_float[e_idx.unwrap() + 1..]).parse::<i64>());
     if exp > 0 && int_cnt > (i64::MAX - exp) {
-        // (exp + inc_cnt) overflows MaxInt64.
-        // TODO: refactor errors
-        return Err(box_err!("[1264] Data Out of Range"));
+        // (exp + inc_cnt) overflows MaxInt64. Add warning and return original float string
+        ctx.warnings
+            .append_warning(Error::overflow("BIGINT", &valid_float));
+        return Ok(Cow::Owned(valid_float.to_owned()));
     }
     if int_cnt + exp <= 0 {
         return Ok(Cow::Borrowed("0"));
@@ -302,9 +311,10 @@ fn float_str_to_int_string<'a, 'b: 'a>(valid_float: &'b str) -> Result<Cow<'a, s
 
     let extra_zero_count = exp + int_cnt - digits_cnt;
     if extra_zero_count > MAX_ZERO_COUNT {
-        // Return overflow to avoid allocating too much memory.
-        // TODO: refactor errors
-        return Err(box_err!("[1264] Data Out of Range"));
+        // Overflows MaxInt64. Add warning and return original float string
+        ctx.warnings
+            .append_warning(Error::overflow("BIGINT", &valid_float));
+        return Ok(Cow::Owned(valid_float.to_owned()));
     }
 
     if extra_zero_count >= 0 {
@@ -323,13 +333,13 @@ fn float_str_to_int_string<'a, 'b: 'a>(valid_float: &'b str) -> Result<Cow<'a, s
 const MAX_ZERO_COUNT: i64 = 20;
 
 #[cfg(test)]
-mod test {
+mod tests {
     use std::f64::EPSILON;
     use std::sync::Arc;
     use std::{f64, i64, isize, u64};
 
-    use coprocessor::codec::mysql::types;
-    use coprocessor::dag::expr::{EvalConfig, EvalContext};
+    use crate::coprocessor::codec::error::ERR_DATA_OUT_OF_RANGE;
+    use crate::coprocessor::dag::expr::{EvalConfig, EvalContext};
 
     use super::*;
 
@@ -451,16 +461,26 @@ mod test {
 
     #[test]
     fn test_invalid_get_valid_int_prefix() {
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::default_for_test()));
         let cases = vec!["1e21", "1e9223372036854775807"];
 
+        // Firstly, make sure no error returns, instead a valid float string is returned
         for i in cases {
-            let o = super::float_str_to_int_string(i);
-            assert!(o.is_err());
+            let o = super::get_valid_int_prefix(&mut ctx, i);
+            assert_eq!(o.unwrap(), i);
+        }
+
+        // Secondly, make sure warnings are attached when the float string cannot be casted to a valid int string
+        let warnings = ctx.take_warnings().warnings;
+        assert_eq!(warnings.len(), 2);
+        for warning in warnings {
+            assert_eq!(warning.get_code(), ERR_DATA_OUT_OF_RANGE);
         }
     }
 
     #[test]
     fn test_valid_get_valid_int_prefix() {
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::default_for_test()));
         let cases = vec![
             (".1", "0"),
             (".0", "0"),
@@ -472,36 +492,39 @@ mod test {
             ("123.456789e5", "12345678"),
             ("-123.45678e5", "-12345678"),
             ("+123.45678e5", "+12345678"),
+            ("9e20", "900000000000000000000"), // TODO: check code validity again on function float_str_to_int_string(),
+                                               // as "900000000000000000000" is already larger than i64::MAX
         ];
 
         for (i, e) in cases {
-            let o = super::float_str_to_int_string(i);
+            let o = super::get_valid_int_prefix(&mut ctx, i);
             assert_eq!(o.unwrap(), *e);
         }
+        assert_eq!(ctx.take_warnings().warnings.len(), 0);
     }
 
     #[test]
     fn test_convert_uint_into_int() {
-        assert!(convert_uint_to_int(u64::MAX, i64::MAX, types::LONG_LONG).is_err());
-        let v = convert_uint_to_int(u64::MIN, i64::MAX, types::LONG_LONG).unwrap();
+        assert!(convert_uint_to_int(u64::MAX, i64::MAX, FieldTypeTp::LongLong).is_err());
+        let v = convert_uint_to_int(u64::MIN, i64::MAX, FieldTypeTp::LongLong).unwrap();
         assert_eq!(v, u64::MIN as i64);
         // TODO port tests from tidb(tidb haven't implemented now)
     }
 
     #[test]
     fn test_convert_float_to_int() {
-        assert!(convert_float_to_int(f64::MIN, i64::MIN, i64::MAX, types::DOUBLE).is_err());
-        assert!(convert_float_to_int(f64::MAX, i64::MIN, i64::MAX, types::DOUBLE).is_err());
-        let v = convert_float_to_int(0.1, i64::MIN, i64::MAX, types::DOUBLE).unwrap();
+        assert!(convert_float_to_int(f64::MIN, i64::MIN, i64::MAX, FieldTypeTp::Double).is_err());
+        assert!(convert_float_to_int(f64::MAX, i64::MIN, i64::MAX, FieldTypeTp::Double).is_err());
+        let v = convert_float_to_int(0.1, i64::MIN, i64::MAX, FieldTypeTp::Double).unwrap();
         assert_eq!(v, 0);
         // TODO port tests from tidb(tidb haven't implemented now)
     }
 
     #[test]
     fn test_convert_float_to_uint() {
-        assert!(convert_float_to_uint(f64::MIN, u64::MAX, types::DOUBLE).is_err());
-        assert!(convert_float_to_uint(f64::MAX, u64::MAX, types::DOUBLE).is_err());
-        let v = convert_float_to_uint(0.1, u64::MAX, types::DOUBLE).unwrap();
+        assert!(convert_float_to_uint(f64::MIN, u64::MAX, FieldTypeTp::Double).is_err());
+        assert!(convert_float_to_uint(f64::MAX, u64::MAX, FieldTypeTp::Double).is_err());
+        let v = convert_float_to_uint(0.1, u64::MAX, FieldTypeTp::Double).unwrap();
         assert_eq!(v, 0);
         // TODO port tests from tidb(tidb haven't implemented now)
     }
@@ -510,7 +533,7 @@ mod test {
     fn test_truncate_binary() {
         let s = b"123456789".to_vec();
         let mut s1 = s.clone();
-        truncate_binary(&mut s1, UNSPECIFIED_LENGTH as isize);
+        truncate_binary(&mut s1, cop_datatype::UNSPECIFIED_LENGTH);
         assert_eq!(s1, s);
         let mut s2 = s.clone();
         truncate_binary(&mut s2, isize::MAX);

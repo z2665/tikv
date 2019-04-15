@@ -1,35 +1,29 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 mod half;
 mod keys;
 mod size;
 mod table;
 
-use rocksdb::DB;
+use engine::rocks::DB;
+use kvproto::metapb::Region;
+use kvproto::pdpb::CheckPolicy;
 
 use super::error::Result;
 use super::{KeyEntry, ObserverContext, SplitChecker};
-use kvproto::metapb::Region;
 
-pub use self::half::HalfCheckObserver;
-pub use self::keys::KeysCheckObserver;
-pub use self::size::SizeCheckObserver;
+pub use self::half::{get_region_approximate_middle, HalfCheckObserver};
+pub use self::keys::{
+    get_region_approximate_keys, get_region_approximate_keys_cf, KeysCheckObserver,
+};
+pub use self::size::{
+    get_region_approximate_size, get_region_approximate_size_cf, SizeCheckObserver,
+};
 pub use self::table::TableCheckObserver;
 
 #[derive(Default)]
 pub struct Host {
-    checkers: Vec<Box<SplitChecker>>,
+    checkers: Vec<Box<dyn SplitChecker>>,
     auto_split: bool,
 }
 
@@ -51,6 +45,15 @@ impl Host {
         self.checkers.is_empty()
     }
 
+    pub fn policy(&self) -> CheckPolicy {
+        for checker in &self.checkers {
+            if checker.policy() == CheckPolicy::APPROXIMATE {
+                return CheckPolicy::APPROXIMATE;
+            }
+        }
+        CheckPolicy::SCAN
+    }
+
     /// Hook to call for every check during split.
     ///
     /// Return true means abort early.
@@ -64,8 +67,8 @@ impl Host {
         false
     }
 
-    pub fn split_keys(self) -> Vec<Vec<u8>> {
-        for mut checker in self.checkers {
+    pub fn split_keys(&mut self) -> Vec<Vec<u8>> {
+        for checker in &mut self.checkers {
             let keys = checker.split_keys();
             if !keys.is_empty() {
                 return keys;
@@ -74,22 +77,18 @@ impl Host {
         vec![]
     }
 
-    pub fn approximate_split_key(
-        mut self,
-        region: &Region,
-        engine: &DB,
-    ) -> Result<Option<Vec<u8>>> {
+    pub fn approximate_split_keys(&mut self, region: &Region, engine: &DB) -> Result<Vec<Vec<u8>>> {
         for checker in &mut self.checkers {
-            match box_try!(checker.approximate_split_key(region, engine)) {
-                Some(split_key) => return Ok(Some(split_key)),
-                None => continue,
+            let keys = box_try!(checker.approximate_split_keys(region, engine));
+            if !keys.is_empty() {
+                return Ok(keys);
             }
         }
-        Ok(None)
+        Ok(vec![])
     }
 
     #[inline]
-    pub fn add_checker(&mut self, checker: Box<SplitChecker>) {
+    pub fn add_checker(&mut self, checker: Box<dyn SplitChecker>) {
         self.checkers.push(checker);
     }
 }

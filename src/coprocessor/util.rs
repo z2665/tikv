@@ -1,21 +1,9 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use kvproto::coprocessor as coppb;
 use tipb::schema::ColumnInfo;
 
-use super::codec::datum::Datum;
-use super::codec::mysql;
+use crate::coprocessor::codec::datum::Datum;
 
 /// Convert the key to the smallest key which is larger than the key given.
 pub fn convert_to_prefix_next(key: &mut Vec<u8>) {
@@ -98,13 +86,16 @@ pub fn is_prefix_next(key: &[u8], next: &[u8]) -> bool {
 }
 
 /// `is_point` checks if the key range represents a point.
+#[inline]
 pub fn is_point(range: &coppb::KeyRange) -> bool {
     is_prefix_next(range.get_start(), range.get_end())
 }
 
 #[inline]
 pub fn get_pk(col: &ColumnInfo, h: i64) -> Datum {
-    if mysql::has_unsigned_flag(col.get_flag() as u64) {
+    use cop_datatype::{FieldTypeAccessor, FieldTypeFlag};
+
+    if col.flag().contains(FieldTypeFlag::UNSIGNED) {
         // PK column is unsigned
         Datum::U64(h as u64)
     } else {
@@ -113,7 +104,7 @@ pub fn get_pk(col: &ColumnInfo, h: i64) -> Datum {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
     fn test_prefix_next_once(key: &[u8], expected: &[u8]) {

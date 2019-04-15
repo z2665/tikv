@@ -1,30 +1,20 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
 
 use tipb::executor::Selection;
 
-use coprocessor::dag::expr::{EvalConfig, EvalContext, EvalWarnings, Expression};
-use coprocessor::Result;
+use crate::coprocessor::dag::expr::{EvalConfig, EvalContext, EvalWarnings, Expression};
+use crate::coprocessor::Result;
 
 use super::{Executor, ExecutorMetrics, ExprColumnRefVisitor, Row};
 
+/// Retrieves rows from the source executor and filter rows by expressions.
 pub struct SelectionExecutor {
     conditions: Vec<Expression>,
     related_cols_offset: Vec<usize>, // offset of related columns
     ctx: EvalContext,
-    src: Box<Executor + Send>,
+    src: Box<dyn Executor + Send>,
     first_collect: bool,
 }
 
@@ -32,14 +22,14 @@ impl SelectionExecutor {
     pub fn new(
         mut meta: Selection,
         eval_cfg: Arc<EvalConfig>,
-        src: Box<Executor + Send>,
+        src: Box<dyn Executor + Send>,
     ) -> Result<SelectionExecutor> {
         let conditions = meta.take_conditions().into_vec();
         let mut visitor = ExprColumnRefVisitor::new(src.get_len_of_columns());
         visitor.batch_visit(&conditions)?;
-        let mut ctx = EvalContext::new(eval_cfg);
+        let ctx = EvalContext::new(eval_cfg);
         Ok(SelectionExecutor {
-            conditions: Expression::batch_build(&mut ctx, conditions)?,
+            conditions: Expression::batch_build(&ctx, conditions)?,
             related_cols_offset: visitor.column_offsets(),
             ctx,
             src,
@@ -48,12 +38,11 @@ impl SelectionExecutor {
     }
 }
 
-#[cfg_attr(feature = "cargo-clippy", allow(never_loop))]
 impl Executor for SelectionExecutor {
     fn next(&mut self) -> Result<Option<Row>> {
         'next: while let Some(row) = self.src.next()? {
             let row = row.take_origin();
-            let cols = row.inflate_cols_with_offsets(&mut self.ctx, &self.related_cols_offset)?;
+            let cols = row.inflate_cols_with_offsets(&self.ctx, &self.related_cols_offset)?;
             for filter in &self.conditions {
                 let val = filter.eval(&mut self.ctx, &cols)?;
                 if !val.into_bool(&mut self.ctx)?.unwrap_or(false) {
@@ -79,7 +68,7 @@ impl Executor for SelectionExecutor {
 
     fn take_eval_warnings(&mut self) -> Option<EvalWarnings> {
         if let Some(mut warnings) = self.src.take_eval_warnings() {
-            warnings.merge(self.ctx.take_warnings());
+            warnings.merge(&mut self.ctx.take_warnings());
             Some(warnings)
         } else {
             Some(self.ctx.take_warnings())
@@ -96,19 +85,13 @@ mod tests {
     use std::i64;
     use std::sync::Arc;
 
-    use kvproto::kvrpcpb::IsolationLevel;
-    use protobuf::RepeatedField;
-    use tipb::executor::TableScan;
+    use cop_datatype::FieldTypeTp;
     use tipb::expression::{Expr, ExprType, ScalarFuncSig};
 
-    use coprocessor::codec::datum::Datum;
-    use coprocessor::codec::mysql::types;
-    use storage::SnapshotStore;
-    use util::codec::number::NumberEncoder;
+    use crate::coprocessor::codec::datum::Datum;
+    use tikv_util::codec::number::NumberEncoder;
 
-    use super::super::scanner::test::{get_range, new_col_info, TestStore};
-    use super::super::table_scan::TableScanExecutor;
-    use super::super::topn::test::gen_table_data;
+    use super::super::tests::*;
     use super::*;
 
     fn new_const_expr() -> Expr {
@@ -149,11 +132,10 @@ mod tests {
 
     #[test]
     fn test_selection_executor_simple() {
-        let tid = 1;
         let cis = vec![
-            new_col_info(1, types::LONG_LONG),
-            new_col_info(2, types::VARCHAR),
-            new_col_info(3, types::NEW_DECIMAL),
+            new_col_info(1, FieldTypeTp::LongLong),
+            new_col_info(2, FieldTypeTp::VarChar),
+            new_col_info(3, FieldTypeTp::NewDecimal),
         ];
         let raw_data = vec![
             vec![
@@ -193,31 +175,16 @@ mod tests {
             ],
         ];
 
-        let table_data = gen_table_data(tid, &cis, &raw_data);
-        let mut test_store = TestStore::new(&table_data);
-
-        let mut table_scan = TableScan::new();
-        table_scan.set_table_id(tid);
-        table_scan.set_columns(RepeatedField::from_vec(cis.clone()));
-        // prepare range
-        let key_ranges = vec![get_range(tid, 0, i64::MAX)];
-
-        let (snapshot, start_ts) = test_store.get_snapshot();
-        let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
-
-        let inner_table_scan =
-            TableScanExecutor::new(table_scan, key_ranges, store, false).unwrap();
+        let inner_table_scan = gen_table_scan_executor(1, cis, &raw_data, None);
 
         // selection executor
         let mut selection = Selection::new();
         let expr = new_const_expr();
         selection.mut_conditions().push(expr);
 
-        let mut selection_executor = SelectionExecutor::new(
-            selection,
-            Arc::new(EvalConfig::default()),
-            Box::new(inner_table_scan),
-        ).unwrap();
+        let mut selection_executor =
+            SelectionExecutor::new(selection, Arc::new(EvalConfig::default()), inner_table_scan)
+                .unwrap();
 
         let mut selection_rows = Vec::with_capacity(raw_data.len());
         while let Some(row) = selection_executor.next().unwrap() {
@@ -232,11 +199,10 @@ mod tests {
 
     #[test]
     fn test_selection_executor_condition() {
-        let tid = 1;
         let cis = vec![
-            new_col_info(1, types::LONG_LONG),
-            new_col_info(2, types::VARCHAR),
-            new_col_info(3, types::LONG_LONG),
+            new_col_info(1, FieldTypeTp::LongLong),
+            new_col_info(2, FieldTypeTp::VarChar),
+            new_col_info(3, FieldTypeTp::LongLong),
         ];
         let raw_data = vec![
             vec![Datum::I64(1), Datum::Bytes(b"a".to_vec()), Datum::I64(7)],
@@ -248,29 +214,16 @@ mod tests {
             vec![Datum::I64(7), Datum::Bytes(b"f".to_vec()), Datum::I64(6)],
         ];
 
-        let table_data = gen_table_data(tid, &cis, &raw_data);
-        let mut test_store = TestStore::new(&table_data);
-
-        let mut table_scan = TableScan::new();
-        table_scan.set_table_id(tid);
-        table_scan.set_columns(RepeatedField::from_vec(cis.clone()));
-        // prepare range
-        let key_ranges = vec![get_range(tid, 0, i64::MAX)];
-
-        let (snapshot, start_ts) = test_store.get_snapshot();
-        let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
-        let inner_table_scan = TableScanExecutor::new(table_scan, key_ranges, store, true).unwrap();
+        let inner_table_scan = gen_table_scan_executor(1, cis, &raw_data, None);
 
         // selection executor
         let mut selection = Selection::new();
         let expr = new_col_gt_u64_expr(2, 5);
         selection.mut_conditions().push(expr);
 
-        let mut selection_executor = SelectionExecutor::new(
-            selection,
-            Arc::new(EvalConfig::default()),
-            Box::new(inner_table_scan),
-        ).unwrap();
+        let mut selection_executor =
+            SelectionExecutor::new(selection, Arc::new(EvalConfig::default()), inner_table_scan)
+                .unwrap();
 
         let mut selection_rows = Vec::with_capacity(raw_data.len());
         while let Some(row) = selection_executor.next().unwrap() {
